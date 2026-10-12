@@ -61,6 +61,8 @@ add_library(lhp_tracking STATIC
     src/tracking/model/DeviceModel.cpp
     src/tracking/solver/PoseSolver.cpp
     src/tracking/solver/Scene.cpp
+    src/tracking/solver/UniverseIo.cpp
+    src/tracking/filter/TrackerFilter.cpp
     src/tracking/sim/Simulator.cpp
     src/tracking/service/HostGuard.cpp
     src/tracking/service/DevicePipeline.cpp

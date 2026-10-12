@@ -34,8 +34,14 @@ struct SimConfig {
     std::vector<SimDevice> devices;
     double angleNoiseRad = 2e-5;
     double missProbability = 0.02;    // per sweep
+    double accNoise = 0.03;           // m/s^2 per sample (real trackers: ~0.03)
+    double gyroNoise = 0.004;         // rad/s per sample
+    math::Vec3 gyroBias{0.004, -0.003, 0.002};   // rad/s, uncalibrated residual the filter must estimate
     uint32_t seed = 1;
 };
+
+/// Simulated device clocks start here (device seconds = simulation seconds + this).
+constexpr double kDeviceClockStart = 5.0;
 
 /// A ready-made scene (2 base stations, several moving devices) for demo mode.
 SimConfig DemoScene(const std::vector<std::string>& receiverSerials);

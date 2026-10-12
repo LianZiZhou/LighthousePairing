@@ -24,6 +24,11 @@ The Lighthouse wire-format decoding and LH2 math in `src/tracking/` are ported (
 - `lighthouse/Ootx.cpp` – OOTX bit stream decoder (`ootx_decoder.c`)
 - `lighthouse/BaseStation.cpp` – OOTX v15 calibration layout, gen2 reprojection model (`ootx_decoder.c`, `survive_reproject_gen2.c`)
 - `lighthouse/Lh2Processor.cpp` – rotor frequencies, sync / sweep to angle (`survive_process_gen2.c`)
+- `filter/TrackerFilter.cpp` – state layout (pose, velocity, angular velocity, acceleration, IMU biases), IMU
+  measurement model, zero-velocity updates and default noise parameters (`survive_kalman_tracker.c`); the filter
+  itself (error-state iterated update, per-hit time extrapolation) is original
+- `filter/Imu.h` – IMU scale for watchman devices (`survive_default_devices.c`)
+- `solver/UniverseIo.cpp` – SteamVR `lighthousedb.json` layout (`survive_default_devices.c`)
 
 libsurvive is distributed under the MIT License reproduced below.
 

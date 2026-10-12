@@ -47,6 +47,12 @@ void TrackingService::Start() {
         simulated_ = false;
         replayPath_.clear();
     }
+    if (world_.cache) {
+        auto u = world_.cache->LoadUniverses();
+        std::scoped_lock wl(world_.mutex);
+        knownUniverses_ = (int)u.size();
+        world_.scene.SetKnownUniverses(std::move(u));
+    }
     stop_ = false;
     running_ = true;
     Log("开始读取原始 HID 数据（被动模式：只读，不向设备发送任何命令）");
@@ -70,6 +76,7 @@ void TrackingService::StartSources(std::vector<std::unique_ptr<io::ReportSource>
         double h = world_.scene.ReferenceHeight();
         world_.scene.Reset();
         world_.scene.SetReferenceHeight(h);
+        knownUniverses_ = 0;
     }
     {
         std::scoped_lock lk(mtx_);
@@ -149,8 +156,27 @@ void TrackingService::StopRecording() {
 void TrackingService::ResetWorld() {
     std::scoped_lock wl(world_.mutex);
     double h = world_.scene.ReferenceHeight();
-    world_.scene.Reset();
+    bool tilt = world_.scene.UseDeviceTilt();
+    world_.scene.Reset();   // also forgets remembered universes: everything is learned again
     world_.scene.SetReferenceHeight(h);
+    world_.scene.SetUseDeviceTilt(tilt);
+    knownUniverses_ = 0;
+}
+
+void TrackingService::SetUseDeviceTilt(bool on) {
+    std::scoped_lock wl(world_.mutex);
+    world_.scene.SetUseDeviceTilt(on);
+}
+
+void TrackingService::MaybeSaveUniverse() {
+    if (!world_.cache) return;
+    solver::UniverseRecord u;
+    {
+        std::scoped_lock wl(world_.mutex);
+        u = world_.scene.ExportUniverse();
+    }
+    if (u.bases.empty() && !u.hasUp) return;
+    world_.cache->SaveUniverse(u);
 }
 
 void TrackingService::SetReferenceHeight(double m) {
@@ -204,6 +230,7 @@ void TrackingService::Discover() {
 void TrackingService::Loop() {
     auto lastDiscover = std::chrono::steady_clock::now() - std::chrono::seconds(10);
     auto lastHost = lastDiscover;
+    auto lastSave = std::chrono::steady_clock::now();
     while (!stop_) {
         auto now = std::chrono::steady_clock::now();
         if (now - lastHost > std::chrono::seconds(2)) {
@@ -221,6 +248,10 @@ void TrackingService::Loop() {
         if (!replay && now - lastDiscover > std::chrono::seconds(2)) {
             lastDiscover = now;
             Discover();
+        }
+        if (!replay && now - lastSave > std::chrono::seconds(10)) {
+            lastSave = now;
+            MaybeSaveUniverse();
         }
         Publish();
         std::this_thread::sleep_for(std::chrono::milliseconds(33));
@@ -255,6 +286,11 @@ void TrackingService::Publish() {
         std::scoped_lock wl(world_.mutex);
         const auto& sc = world_.scene;
         snap->gravityAligned = sc.GravityAligned();
+        snap->useDeviceTilt = sc.UseDeviceTilt();
+        snap->tiltSamples = sc.UpSamples();
+        snap->tiltCorrectionDeg = sc.TiltCorrectionDeg();
+        snap->universeNote = sc.UniverseNote();
+        snap->knownUniverses = knownUniverses_;
         snap->referenceChannel = sc.ReferenceChannel();
         snap->referenceHeight = sc.ReferenceHeight();
         for (int ch = 0; ch < lighthouse::kMaxChannels; ++ch) {
@@ -269,6 +305,9 @@ void TrackingService::Publish() {
             bs.hasPose = b.hasPose;
             if (b.hasPose) bs.worldFromBase = sc.WorldFromBase(ch);
             bs.bootstrapSamples = b.samples;
+            bs.bootstrapRejected = b.rejectedSamples;
+            bs.poseSource = solver::ToString(b.source);
+            bs.poseFixed = b.fixed;
             bs.bootstrapSpreadMm = b.lastSpreadMm;
             snap->bases.push_back(bs);
         }

@@ -13,6 +13,7 @@
 #include "tracking/protocol/WatchmanDecoder.h"
 #include "tracking/service/HostGuard.h"
 #include "tracking/service/TrackingService.h"
+#include "tracking/sim/Simulator.h"
 
 #include <windows.h>
 
@@ -363,7 +364,13 @@ static int Live(double seconds, const std::string& configPath, bool active, cons
         prov->json = ReadFile(configPath);
     service::TrackingService svc(prov);
     svc.SetOptions({active});
-    if (!replay.empty()) {
+    sim::SimConfig simCfg;
+    if (replay == "sim" || replay == "simfast") {   // simulated demo scene (simfast: as fast as possible)
+        simCfg = sim::DemoScene({"SIM-A", "SIM-B"});
+        std::vector<std::unique_ptr<io::ReportSource>> src;
+        for (size_t i = 0; i < simCfg.devices.size(); ++i) src.push_back(sim::OpenSimSource(simCfg, i, (uint16_t)i, replay == "sim"));
+        svc.StartSources(std::move(src), "sim", "sim", sim::MakeModelProvider(simCfg), true);
+    } else if (!replay.empty()) {
         std::string err;
         if (!svc.StartReplay(replay, &err)) {
             std::printf("replay: %s\n", err.c_str());
@@ -379,14 +386,40 @@ static int Live(double seconds, const std::string& configPath, bool active, cons
         auto s = svc.Snapshot();
         if (!s) continue;
         for (; logShown < s->log.size(); ++logShown) std::printf("  log: %s\n", s->log[logShown].c_str());
-        std::printf("%.0fs  %s  steamvr=%d devices=%zu bases=%zu gravity=%d\n", (io::HostMicros() - t0) / 1e6, s->activeNote.c_str(), s->host.steamVrRunning,
-                    s->devices.size(), s->bases.size(), s->gravityAligned);
+        std::printf("%.0fs  %s  steamvr=%d devices=%zu bases=%zu gravity=%d tilt=%d samples %.2fdeg %s\n", (io::HostMicros() - t0) / 1e6, s->activeNote.c_str(),
+                    s->host.steamVrRunning, s->devices.size(), s->bases.size(), s->gravityAligned, s->tiltSamples, s->tiltCorrectionDeg, s->universeNote.c_str());
         for (auto& d : s->devices) {
             if (d.decoder.packets == 0) continue;
             auto& p = d.worldFromDevice.pos;
+            if (!simCfg.devices.empty() && d.poseTime > 0) {   // ground truth, mapped into the service world via the reference base
+                math::Pose svcFromSim;
+                for (auto& b : s->bases)
+                    if (b.isReference)
+                        for (auto& sb : simCfg.bases)
+                            if (sb.channel == b.channel) svcFromSim = b.worldFromBase * sb.worldFromBase.Inverse();
+                size_t i = d.receiverSerial == "SIM-A" ? 0 : 1;
+                math::Pose t = svcFromSim * simCfg.devices[i].trajectory(d.poseTime - sim::kDeviceClockStart);
+                std::printf("   truth %s (%+.4f %+.4f %+.4f) err=%.1fmm %.2fdeg  simT=%.1fs  lag scan:", d.receiverSerial.c_str(), t.pos.x, t.pos.y, t.pos.z,
+                            math::Norm(t.pos - p) * 1000, math::Norm((d.worldFromDevice.rot * t.rot.Conj()).ToRotVec()) * 57.2958, d.poseTime - sim::kDeviceClockStart);
+                for (int ms = -30; ms <= 30; ms += 10) {
+                    math::Pose tl = svcFromSim * simCfg.devices[i].trajectory(d.poseTime - sim::kDeviceClockStart + ms * 1e-3);
+                    std::printf(" %+d:%.1fmm/%.2fdeg", ms, math::Norm(tl.pos - p) * 1000, math::Norm((d.worldFromDevice.rot * tl.rot.Conj()).ToRotVec()) * 57.2958);
+                }
+                std::printf("\n");
+            }
             std::printf("   %s %s mode=%s imu=%.0fHz rep=%.0f/s pose=%d (%+.3f %+.3f %+.3f) rms=%.4f sigma=%.1fmm used=%d bases=%d solve=%.0fus g=%.2fdeg %s %s\n", d.receiverSerial.c_str(),
                         d.deviceSerial.c_str(), protocol::ToString(d.lightMode), d.imu.rateHz, d.reportRate, d.hasPose, p.x, p.y, p.z, d.rmsDeg, d.positionSigmaMm, d.used,
                         d.basesUsed, d.solveUs, d.imu.gravityErrorDeg, d.modeNote.c_str(), d.solveNote.c_str());
+            const auto& f = d.filter;
+            std::printf("      filter %s pos=(%+.4f %+.4f %+.4f) sig=%.2fmm/%.3fdeg v=%.3f w=%.2fdeg/s light=%.0fHz rms=%.4f->%.4fdeg nis=%.2f used=%d gated=%d lag=%.1fms "
+                        "upd=%.0fus imuNis=%.2f still=%d zvu=%d bg=(%+.4f %+.4f %+.4f) ba=(%+.3f %+.3f %+.3f) batchDiff=%.1fmm/%.2fdeg resets=%llu %s %s\n",
+                        service::ToString(f.state), p.x, p.y, p.z, f.posSigmaMm, f.rotSigmaDeg, math::Norm(f.velocity), math::Norm(f.angularVelocity) * 57.2958,
+                        f.lightUpdateHz, f.lastRmsBeforeDeg, f.lastRmsAfterDeg, f.lastNis, f.lastUsed, f.lastGated, f.lastLagMs, f.lightUpdateUs, f.imuNis, f.still, f.zvu,
+                        f.gyroBias.x, f.gyroBias.y, f.gyroBias.z, f.accBias.x, f.accBias.y, f.accBias.z, f.batchDiffMm, f.batchDiffDeg,
+                        (unsigned long long)f.resets, f.lastResetReason.c_str(), f.lastNote.c_str());
+            std::printf("      light applied=%llu skipped=%llu:", (unsigned long long)f.lightUpdates, (unsigned long long)f.lightSkipped);
+            for (auto& [why, n] : f.skipReasons) std::printf(" [%s]=%llu", why.c_str(), (unsigned long long)n);
+            std::printf("\n");
         }
         for (auto& b : s->bases)
             std::printf("   base ch%d ref=%d cal=%d id=%08X pose=%d pos=(%+.3f %+.3f %+.3f) hz=%.4f syncs=%llu ootx=%u/%u\n", b.channel + 1, b.isReference, b.hasCalibration, b.cal.id,

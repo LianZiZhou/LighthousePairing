@@ -17,6 +17,7 @@ using namespace tracking;
 using service::BaseSnapshot;
 using service::DeviceSnapshot;
 using service::SensorSnapshot;
+using service::TrackState;
 
 namespace {
 
@@ -449,18 +450,24 @@ void SpatialView::DrawInspector(const Snap& s) {
 
 void SpatialView::TabDevice(const Snap& s, const Dev& d) {
     const auto& p = Pal();
+    const auto& f = d.filter;
     ImGui::BeginChild("##devtab");
     if (BeginPropTable("##id", ImGui::GetFontSize() * 8)) {
         PropRow("接收器", d.receiverSerial, true);
         PropRow("设备", d.deviceSerial.empty() ? "（未知）" : d.deviceSerial + "  " + d.modelNumber, true);
         PropRow("设备模型", d.hasModel ? Fmt("%zu 个传感器", d.sensors.size()) : d.modelNote);
         PropRow("光数据模式", d.modeNote.empty() ? ModeShort(d.lightMode) : d.modeNote);
+        ImVec4 sc = f.state == TrackState::Tracking ? p.success : f.state == TrackState::ImuOnly ? p.warning : f.state == TrackState::Lost ? p.danger : p.textDim;
+        std::string st = std::string(service::ToString(f.state)) + " · " + f.note;
+        if (f.state == TrackState::Tracking || f.state == TrackState::ImuOnly) st += Fmt("（%.0f 秒）", f.trackingSeconds);
+        PropRow("跟踪状态", st, false, &sc);
+        if (f.resets) PropRow("重置次数", Fmt("%llu · 最近一次：%s", (unsigned long long)f.resets, f.lastResetReason.c_str()));
         EndPropTable();
     }
     ImGui::Spacing();
     SectionTitle(ICON_LOCATION, "位姿", d.hasPose ? (s.gravityAligned ? "（世界坐标，Y 向上，单位 m）" : "（参考基站坐标系，尚未对齐重力）") : nullptr);
     if (!d.hasPose) {
-        TextColored2(p.warning, "%s", d.hasModel ? (d.solveNote.empty() ? "等待光学数据" : d.solveNote.c_str()) : d.modelNote.c_str());
+        TextColored2(p.warning, "%s", d.hasModel ? (d.solveNote.empty() ? f.note.c_str() : d.solveNote.c_str()) : d.modelNote.c_str());
     }
     if (BeginPropTable("##pose", ImGui::GetFontSize() * 8)) {
         const auto& P = d.worldFromDevice;
@@ -471,45 +478,84 @@ void SpatialView::TabDevice(const Snap& s, const Dev& d) {
         PropRow("姿态 偏航/俯仰/横滚", Fmt("%+.2f°  %+.2f°  %+.2f°", yaw, pitch, roll));
         PropRow("四元数 w x y z", Fmt("%+.5f %+.5f %+.5f %+.5f", P.rot.w, P.rot.x, P.rot.y, P.rot.z), true);
         PropRow("速度", Fmt("%.3f m/s  (%s)", math::Norm(d.velocity), Vec(d.velocity, 1, "%+.3f").c_str()));
-        if (d.imu.valid) PropRow("角速度（陀螺仪）", Fmt("%.1f °/s", math::Norm(d.imu.gyro) * kRad2Deg));
-        if (d.velocityEstimated)
-            PropRow("角速度（光学解算）", Fmt("%.1f °/s  (%s)", math::Norm(d.angularVelocity) * kRad2Deg, Vec(d.angularVelocity, kRad2Deg, "%+.1f").c_str()));
-        PropRow("运动模型", d.velocityEstimated ? "位姿 + 速度联合解算（消除观测窗口内的运动模糊）" : "静态位姿");
+        if (d.velocityEstimated) {
+            PropRow("角速度（滤波）", Fmt("%.1f °/s  (%s)", math::Norm(d.angularVelocity) * kRad2Deg, Vec(d.angularVelocity, kRad2Deg, "%+.1f").c_str()));
+            PropRow("线加速度（不含重力）", Fmt("%.2f m/s²  (%s)", math::Norm(f.acceleration), Vec(f.acceleration, 1, "%+.2f").c_str()));
+        }
+        if (d.imu.valid) PropRow("角速度（陀螺仪原始）", Fmt("%.1f °/s", math::Norm(d.imu.gyro) * kRad2Deg));
         for (auto& b : s.bases)
             if (b.hasPose) PropRow(("到" + BaseName(b)).c_str(), Fmt("%.3f m", math::Norm(P.pos - b.worldFromBase.pos)));
-        PropRow("位姿年龄", Fmt("%.0f ms", d.poseAgeMs));
-        EndPropTable();
-    }
-    ImGui::Spacing();
-    SectionTitle(ICON_DIAG, "解算质量");
-    if (BeginPropTable("##q", ImGui::GetFontSize() * 8)) {
-        ImVec4 rc = d.rmsDeg < 0.01 ? p.success : d.rmsDeg < 0.05 ? p.warning : p.danger;
-        PropRow("重投影残差 RMS", Fmt("%.4f°  (%.1f 角秒)", d.rmsDeg, d.rmsDeg * 3600), false, &rc);
-        PropRow("最大残差", Fmt("%.4f°", d.maxDeg));
-        PropRow("初值残差", Fmt("%.4f°", d.initialRmsDeg));
-        PropRow("使用 / 剔除观测", Fmt("%d / %d  · %d 个基站", d.used, d.rejected, d.basesUsed));
-        PropRow("迭代 / 种子", Fmt("%d / %d", d.iterations, d.seedsTried));
-        PropRow("位置不确定度 σ", Fmt("%.2f mm  (x %.2f  y %.2f  z %.2f)", d.positionSigmaMm, std::sqrt(std::max(0.0, d.covariance[21])) * 1000,
-                                       std::sqrt(std::max(0.0, d.covariance[28])) * 1000, std::sqrt(std::max(0.0, d.covariance[35])) * 1000));
-        PropRow("姿态不确定度 σ", Fmt("%.3f°  (rx %.3f  ry %.3f  rz %.3f)", d.rotationSigmaDeg, std::sqrt(std::max(0.0, d.covariance[0])) * kRad2Deg,
-                                       std::sqrt(std::max(0.0, d.covariance[7])) * kRad2Deg, std::sqrt(std::max(0.0, d.covariance[14])) * kRad2Deg));
-        PropRow("解算耗时", Fmt("%.0f µs", d.solveUs));
-        PropRow("解算次数 / 失败", Fmt("%llu / %llu", (unsigned long long)d.solves, (unsigned long long)d.solveFailures));
+        PropRow("距上次光学更新", Fmt("%.0f ms", d.poseAgeMs));
         if (d.imu.gravityErrorDeg >= 0) {
             ImVec4 gc = d.imu.gravityErrorDeg < 3 ? p.success : d.imu.gravityErrorDeg < 8 ? p.warning : p.danger;
             PropRow("IMU 重力 vs 光学姿态", Fmt("%.2f°", d.imu.gravityErrorDeg), false, &gc);
         }
         EndPropTable();
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("σ 来自 (JᵀJ)⁻¹·残差方差；重力夹角 = IMU 测到的“上”经光学姿态转到世界后与竖直方向的夹角");
+
+    const bool filt = f.state == TrackState::Tracking || f.state == TrackState::ImuOnly || f.state == TrackState::Lost;
     ImGui::Spacing();
-    if (ImGui::CollapsingHeader("协方差矩阵（rx ry rz tx ty tz）")) {
+    SectionTitle(ICON_DIAG, "跟踪滤波器", "（误差状态迭代卡尔曼：光学 + IMU）");
+    if (!filt) {
+        TextDim("%s", f.note.c_str());
+    } else if (BeginPropTable("##flt", ImGui::GetFontSize() * 8)) {
+        const auto& C = f.poseCovariance;
+        auto sd = [&](int i, double k) { return std::sqrt(std::max(0.0, C[i * 7])) * k; };
+        PropRow("位置 σ", Fmt("%.2f mm  (x %.2f  y %.2f  z %.2f)", f.posSigmaMm, sd(3, 1000), sd(4, 1000), sd(5, 1000)));
+        PropRow("姿态 σ", Fmt("%.3f°  (rx %.3f  ry %.3f  rz %.3f)", f.rotSigmaDeg, sd(0, kRad2Deg), sd(1, kRad2Deg), sd(2, kRad2Deg)));
+        PropRow("速度 / 角速度 σ", Fmt("%.1f mm/s  ·  %.2f °/s", f.velSigma * 1000, f.angVelSigma * kRad2Deg));
+        PropRow("陀螺仪零偏（估计）", Vec(f.gyroBias, kRad2Deg, "%+.3f") + Fmt(" °/s  ±%.3f", f.gyroBiasSigma * kRad2Deg));
+        PropRow("加速度计零偏（估计）", Vec(f.accBias, 1, "%+.3f") + Fmt(" m/s²  ±%.3f", f.accBiasSigma));
+        {
+            std::string why;
+            for (auto& [r, n] : f.skipReasons) why += (why.empty() ? "：" : "，") + r + Fmt(" %llu", (unsigned long long)n);
+            PropRow("光学更新", Fmt("%.0f 次/秒 · 共 %llu 次，跳过 %llu", f.lightUpdateHz, (unsigned long long)f.lightUpdates, (unsigned long long)f.lightSkipped) + why);
+        }
+        PropRow("角度观测 / 被门限拒绝", Fmt("%llu / %llu  (%.2f%%)", (unsigned long long)f.lightMeasurements, (unsigned long long)f.lightGated,
+                                           f.lightMeasurements ? 100.0 * f.lightGated / f.lightMeasurements : 0.0));
+        if (f.lastChannel >= 0) {
+            ImVec4 rc = f.lastRmsAfterDeg < 0.01 ? p.success : f.lastRmsAfterDeg < 0.05 ? p.warning : p.danger;
+            PropRow("最近一次更新", Fmt("%s · 用 %d，拒 %d，背向 %d · 迭代 %d", ChannelName(f.lastChannel).c_str(), f.lastUsed, f.lastGated, f.lastFacingAway, f.lastIterations));
+            PropRow("残差 RMS 更新前 → 后", Fmt("%.4f° → %.4f°", f.lastRmsBeforeDeg, f.lastRmsAfterDeg), false, &rc);
+            PropRow("归一化新息 NIS", Fmt("%.2f（≈1 表示噪声模型与实际一致）", f.lastNis));
+            PropRow("批次跨度 / 滞后", Fmt("%.1f ms / %.1f ms", f.lastSpanMs, f.lastLagMs));
+            if (!f.lastNote.empty()) PropRow("未应用原因", f.lastNote);
+        }
+        PropRow("IMU 更新", Fmt("%llu 次 · 加速度计%s", (unsigned long long)f.imuUpdates, f.accUsed ? "参与" : "未参与（世界尚未对齐重力）"));
+        PropRow("加速度残差（IMU 系）", Vec(f.accResidual, 1, "%+.3f") + " m/s²");
+        PropRow("角速度残差（IMU 系）", Vec(f.gyroResidual, kRad2Deg, "%+.3f") + " °/s");
+        PropRow("静止检测 / 零速更新", Fmt("%s%s · %s", f.still ? "静止" : "运动中", f.still ? Fmt(" %.1f 秒", f.stillSeconds).c_str() : "", f.zvu ? "零速约束生效" : "无"));
+        PropRow("单次光学更新耗时", Fmt("%.0f µs", f.lightUpdateUs));
+        EndPropTable();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("状态：位置、姿态、速度、角速度、线加速度、陀螺仪零偏、加速度计零偏（21 维误差状态）。\n"
+                          "每圈扫描的角度按各自的命中时刻外推后一起融合；IMU 每个样本都更新一次。");
+
+    ImGui::Spacing();
+    SectionTitle(ICON_CHART, "单帧解算", "（启动滤波器、校验、推算基站）");
+    if (BeginPropTable("##q", ImGui::GetFontSize() * 8)) {
+        ImVec4 rc = d.rmsDeg < 0.01 ? p.success : d.rmsDeg < 0.05 ? p.warning : p.danger;
+        PropRow("重投影残差 RMS", Fmt("%.4f°  (%.1f 角秒)", d.rmsDeg, d.rmsDeg * 3600), false, &rc);
+        PropRow("最大残差 / 初值残差", Fmt("%.4f° / %.4f°", d.maxDeg, d.initialRmsDeg));
+        PropRow("使用 / 剔除观测", Fmt("%d / %d  · %d 个基站", d.used, d.rejected, d.basesUsed));
+        PropRow("迭代 / 种子", Fmt("%d / %d", d.iterations, d.seedsTried));
+        PropRow("位置 / 姿态 σ", Fmt("%.2f mm / %.3f°", d.positionSigmaMm, d.rotationSigmaDeg));
+        if (f.hasBatch) PropRow("与滤波器之差", Fmt("%.1f mm / %.2f°", f.batchDiffMm, f.batchDiffDeg));
+        PropRow("解算耗时", Fmt("%.0f µs", d.solveUs));
+        PropRow("解算次数 / 失败", Fmt("%llu / %llu", (unsigned long long)d.solves, (unsigned long long)d.solveFailures));
+        if (!d.solveNote.empty()) PropRow("最近失败原因", d.solveNote);
+        EndPropTable();
+    }
+    ImGui::Spacing();
+    const std::array<double, 36>& cov = filt ? f.poseCovariance : d.covariance;
+    if (ImGui::CollapsingHeader(filt ? "位姿协方差（滤波器，rx ry rz tx ty tz）" : "位姿协方差（单帧解算，rx ry rz tx ty tz）")) {
         if (ImGui::BeginTable("##cov", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchSame)) {
             for (int r = 0; r < 6; ++r) {
                 ImGui::TableNextRow();
                 for (int c = 0; c < 6; ++c) {
                     ImGui::TableNextColumn();
-                    ImGui::Text("%.2e", d.covariance[r * 6 + c]);
+                    ImGui::Text("%.2e", cov[r * 6 + c]);
                 }
             }
             ImGui::EndTable();
@@ -603,6 +649,19 @@ void SpatialView::TabSensors(const Snap& s, const Dev& d) {
 
 void SpatialView::TabBases(const Snap& s, const Dev* d) {
     ImGui::BeginChild("##bases");
+    SectionTitle(ICON_GLOBE, "空间", "（基站布局与水平校正）");
+    if (BeginPropTable("##uni", ImGui::GetFontSize() * 8)) {
+        PropRow("水平基准", s.gravityAligned ? "参考基站加速度计" + (s.tiltSamples ? Fmt(" + 设备 IMU 校正（%d 个静止样本）", s.tiltSamples) : std::string())
+                                            : std::string("尚未对齐（等待参考基站 OOTX）"));
+        if (s.tiltSamples) PropRow("相对基站加速度计的校正", Fmt("%.2f°", s.tiltCorrectionDeg));
+        PropRow("记忆的空间", s.knownUniverses ? Fmt("%d 个（SteamVR 房间设置 / 上次保存）", s.knownUniverses) : std::string("无（基站位置需由设备观测推算）"));
+        if (!s.universeNote.empty()) PropRow("最近", s.universeNote);
+        EndPropTable();
+    }
+    bool tilt = s.useDeviceTilt;
+    if (ImGui::Checkbox("用静止设备的加速度计校正水平", &tilt)) svc_.SetUseDeviceTilt(tilt);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("SteamVR 也会用设备数据修正基站的水平（\"Updating tilt\"）。基站自带的加速度计只有 8 位精度。");
+    ImGui::Spacing();
     if (s.bases.empty()) TextDim("还没有看到基站。设备需要处于 raw1 模式并能看到基站。");
     for (auto& b : s.bases) {
         ImGui::PushID(b.channel);
@@ -628,7 +687,13 @@ void SpatialView::TabBases(const Snap& s, const Dev* d) {
                 Euler(b.worldFromBase.rot, yaw, pitch, roll);
                 PropRow("位置", Vec(b.worldFromBase.pos, 1, "%+.3f") + " m", true);
                 PropRow("姿态 偏航/俯仰/横滚", Fmt("%+.1f°  %+.1f°  %+.1f°", yaw, pitch, roll));
-                PropRow("位置来源", b.isReference ? "参考基站（定义世界坐标）" : Fmt("由设备推算，%d 个样本，最新偏差 %.1f mm", b.bootstrapSamples, b.bootstrapSpreadMm));
+                std::string src = b.poseSource;
+                if (!b.isReference) {
+                    src += b.poseFixed ? std::string(" · 固定") : Fmt(" · %d 个样本", b.bootstrapSamples);
+                    src += Fmt(" · 最新偏差 %.1f mm", b.bootstrapSpreadMm);
+                    if (b.bootstrapRejected) src += Fmt(" · 连续离群 %d", b.bootstrapRejected);
+                }
+                PropRow("位置来源", src);
                 if (d && d->hasPose) PropRow("到所选设备", Fmt("%.3f m", math::Norm(d->worldFromDevice.pos - b.worldFromBase.pos)));
             } else {
                 PropRow("位置", "未知（需要一个同时能看到参考基站和它的设备）");
@@ -720,7 +785,7 @@ void SpatialView::TabPlots(const Dev& d) {
         TextDim("还没有位姿历史。");
         return;
     }
-    std::vector<double> t, rms, sig, x, y, z, used;
+    std::vector<double> t, rms, sig, x, y, z, used, diff, speed;
     double t0 = d.history.back().t;
     for (auto& h : d.history) {
         t.push_back(h.t - t0);
@@ -730,9 +795,17 @@ void SpatialView::TabPlots(const Dev& d) {
         y.push_back(h.pos.y * 1000);
         z.push_back(h.pos.z * 1000);
         used.push_back(h.used);
+        diff.push_back(h.batchDiffMm >= 0 ? h.batchDiffMm : std::nan(""));
+        speed.push_back(h.speed * 1000);
     }
     int n = (int)t.size();
-    float h = std::max(ImGui::GetFontSize() * 8, (ImGui::GetContentRegionAvail().y - ImGui::GetFontSize()) / 3);
+    float h = std::max(ImGui::GetFontSize() * 7, (ImGui::GetContentRegionAvail().y - ImGui::GetFontSize()) / 4);
+    if (ImPlot::BeginPlot("##motion", ImVec2(-1, h), ImPlotFlags_NoMenus)) {
+        ImPlot::SetupAxes("秒", "mm · mm/s", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+        ImPlot::PlotLine("滤波器 vs 单帧解算", t.data(), diff.data(), n);
+        ImPlot::PlotLine("速度", t.data(), speed.data(), n);
+        ImPlot::EndPlot();
+    }
     if (ImPlot::BeginPlot("##rms", ImVec2(-1, h), ImPlotFlags_NoMenus)) {
         ImPlot::SetupAxes("秒", "°", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
         ImPlot::SetupAxis(ImAxis_Y2, "mm", ImPlotAxisFlags_AuxDefault | ImPlotAxisFlags_AutoFit);

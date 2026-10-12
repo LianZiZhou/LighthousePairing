@@ -38,9 +38,56 @@ struct SensorSnapshot {
 struct PoseSample {
     double t = 0;                // seconds (device clock)
     math::Vec3 pos;
-    double rmsDeg = 0;
-    double sigmaMm = 0;
+    double rmsDeg = 0;           // light residual RMS (filter update, or batch solve before tracking)
+    double sigmaMm = 0;          // position sigma
     int used = 0;
+    double batchDiffMm = -1;     // filter vs single-frame solve (-1 = n/a)
+    double speed = 0;            // m/s
+};
+
+/// Tracking state machine (SteamVR logs the same transitions: "Switching Lighthouse -> IMU Only").
+enum class TrackState : uint8_t {
+    NoModel,         // no device geometry yet
+    WaitingLight,    // geometry known, no usable light
+    Bootstrapping,   // waiting for a good single-frame solve to start the filter
+    Tracking,        // filter fusing light + IMU
+    ImuOnly,         // light lost for a moment: orientation from the gyro, position held
+    Lost,            // light lost for long: pose shown is stale
+};
+const char* ToString(TrackState s);
+
+/// Internals of the per-device tracking filter (TrackerFilter).
+struct FilterSnapshot {
+    TrackState state = TrackState::NoModel;
+    std::string note;
+    double trackingSeconds = 0;
+    uint64_t resets = 0;
+    std::string lastResetReason;
+    // state + 1-sigma
+    math::Vec3 velocity, angularVelocity, acceleration, gyroBias, accBias;
+    double posSigmaMm = 0, rotSigmaDeg = 0, velSigma = 0, angVelSigma = 0, gyroBiasSigma = 0, accBiasSigma = 0;
+    std::array<double, 36> poseCovariance{};
+    // optical updates
+    uint64_t lightUpdates = 0, lightSkipped = 0, lightMeasurements = 0, lightGated = 0;
+    double lightUpdateHz = 0;
+    int lastChannel = -1;
+    int lastUsed = 0, lastGated = 0, lastFacingAway = 0, lastIterations = 0;
+    double lastRmsBeforeDeg = 0, lastRmsAfterDeg = 0, lastNis = 0, lastLagMs = 0, lastSpanMs = 0;
+    std::string lastNote;
+    std::vector<std::pair<std::string, uint64_t>> skipReasons;   // why optical batches were not applied
+    double lightUpdateUs = 0;
+    double sinceLightMs = 0;
+    // IMU updates
+    uint64_t imuUpdates = 0;
+    math::Vec3 accResidual, gyroResidual;   // IMU frame
+    double imuNis = 0;
+    bool accUsed = false;
+    bool still = false;
+    double stillSeconds = 0;
+    bool zvu = false;
+    // comparison with the single-frame (bootstrap) solver
+    bool hasBatch = false;
+    double batchDiffMm = 0, batchDiffDeg = 0;
 };
 
 struct ImuSnapshot {
@@ -74,6 +121,7 @@ struct DeviceSnapshot {
     // solve
     bool hasPose = false;
     double poseAgeMs = 0;
+    double poseTime = 0;         // device clock seconds of worldFromDevice
     math::Pose worldFromDevice;
     math::Vec3 velocity;         // m/s
     math::Vec3 angularVelocity;  // rad/s (when solved jointly with the pose)
@@ -85,6 +133,7 @@ struct DeviceSnapshot {
     double solveUs = 0;
     uint64_t solves = 0, solveFailures = 0;
     std::string solveNote;
+    FilterSnapshot filter;
     std::vector<SensorSnapshot> sensors;
     std::vector<math::Vec3> trail;     // recent world positions
     std::vector<PoseSample> history;   // ~60 s
@@ -98,6 +147,9 @@ struct BaseSnapshot {
     lighthouse::BaseCalibration cal;
     bool hasPose = false;
     math::Pose worldFromBase;
+    std::string poseSource;
+    bool poseFixed = false;
+    int bootstrapRejected = 0;
     int bootstrapSamples = 0;
     double bootstrapSpreadMm = 0;
     // aggregated over devices
@@ -122,6 +174,11 @@ struct TrackingSnapshot {
     bool activeAllowed = false;
     std::string activeNote;
     bool gravityAligned = false;
+    bool useDeviceTilt = true;
+    int tiltSamples = 0;               // device IMU gravity samples refining the world "up"
+    double tiltCorrectionDeg = 0;      // applied up vs the reference base accelerometer
+    std::string universeNote;
+    int knownUniverses = 0;            // remembered universes available (saved + SteamVR)
     int referenceChannel = -1;
     double referenceHeight = 2.0;
     std::vector<DeviceSnapshot> devices;

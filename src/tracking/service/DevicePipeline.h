@@ -1,6 +1,8 @@
 #pragma once
 // L4: one report stream (one receiver / wired device) -> decode -> LH2 angles -> pose.
 // Runs on its own thread; publishes into a DeviceSnapshot under its own mutex.
+#include "tracking/filter/Imu.h"
+#include "tracking/filter/TrackerFilter.h"
 #include "tracking/hid/HidDevice.h"
 #include "tracking/io/Recording.h"
 #include "tracking/io/ReportSource.h"
@@ -22,12 +24,16 @@
 
 namespace lhp::tracking::service {
 
-/// Remembers base station calibrations between runs (OOTX takes ~10 s to arrive). Implemented outside tracking.
+/// Remembers base station calibrations and universes between runs (OOTX takes ~10 s to arrive, base poses
+/// minutes of observation). Implemented outside tracking.
 class CalibrationCache {
 public:
     virtual ~CalibrationCache() = default;
     virtual std::optional<lighthouse::BaseCalibration> Load(int channel) = 0;
     virtual void Save(int channel, const lighthouse::BaseCalibration& cal) = 0;
+    /// Universes to restore from, in priority order (e.g. SteamVR's lighthousedb, then our own).
+    virtual std::vector<solver::UniverseRecord> LoadUniverses() { return {}; }
+    virtual void SaveUniverse(const solver::UniverseRecord&) {}
 };
 
 /// The world shared by all pipelines (owned by TrackingService).
@@ -69,7 +75,15 @@ private:
     void OnImu(const protocol::ImuSample& s);
     void OnSync(const protocol::Lh2Sync& s);
     void OnSweep(const protocol::Lh2Sweep& w);
+    /// Single-frame solve (SteamVR's CLighthousePoseSolver role): starts the filter, checks it, bootstraps bases.
     void TrySolve(protocol::Ticks now);
+    /// Feeds buffered sweep angles to the filter (one update per base station).
+    void FlushLight(bool force);
+    void SyncWorld();               // re-express the filter when the world frame changed
+    void ResetFilter(const std::string& reason);
+    void OnTimeBaseReset(const std::string& reason);   // device timestamps changed epoch
+    bool CheckClock(protocol::Ticks t);
+    void UpdateTrackState(double t);
     void MaybeSwitchMode(uint64_t hostUs);
     void TryLoadModel(uint64_t hostUs);
 
@@ -106,14 +120,40 @@ private:
     std::vector<int> lastMeasChannel_;   // channel per measurement
     std::vector<solver::BaseView> lastBases_;
     std::map<int, math::Pose> baseLocal_;   // per channel: last device pose in that base's frame (bootstrap)
-    protocol::Ticks poseTime_ = 0;
+    protocol::Ticks poseTime_ = 0;          // last good single-frame solve
     math::Pose lastGoodPose_;
     uint64_t solves_ = 0, solveFailures_ = 0;
     double solveUs_ = 0;
     int basesUsed_ = 0;
     std::deque<PoseSample> history_;
     std::deque<math::Vec3> trail_;
-    math::Vec3 velocity_;
+    int batchDisagree_ = 0;
+
+    // tracking filter
+    std::optional<filter::TrackerFilter> filter_;
+    filter::StillnessDetector still_;
+    FilterSnapshot fs_;                     // diagnostics, updated as we go
+    TrackState state_ = TrackState::NoModel;
+    double trackingSince_ = 0;
+    double lastLightUpdateT_ = 0;           // device seconds of the last applied light update
+    double lastHistoryT_ = 0, lastUpSampleT_ = 0;
+    uint64_t timeBaseResets_ = 0;
+    int badLight_ = 0;                      // consecutive rejected light batches
+    uint64_t worldVersion_ = 0;
+    math::Pose worldFromRefSeen_;
+    bool worldAligned_ = false;
+    struct PendingObs {
+        lighthouse::Lh2Observation o;
+        int sensor;                         // model index
+    };
+    std::map<int, std::vector<PendingObs>> pending_;   // per channel, not yet fused
+    std::map<int, std::vector<filter::LightMeas>> lastLightMeas_;   // per channel: last fused batch (for display)
+    std::map<int, filter::LightUpdate> lastLight_;
+    std::map<std::string, uint64_t> skipReasons_;
+    std::map<int, uint64_t> calKeys_;       // per channel: calibration the filter last used
+    std::map<int, uint32_t> ootxLogged_;    // per channel: base id already announced in the log
+    double lightRateWindowT_ = 0;
+    uint64_t lightRateWindowN_ = 0;
 
     // imu
     ImuSnapshot imu_;

@@ -162,8 +162,11 @@ SimConfig DemoScene(const std::vector<std::string>& receivers) {
         double phase = i * 1.7;
         Vec3 centre{0.4 * std::cos(phase), 0.2 + 0.45 * (i % 3), -1.8 + 0.4 * std::sin(phase)};
         d.trajectory = [centre, phase, i](double t) {
-            // move for 6 s, hold still for 3 s (lets the second base station bootstrap)
-            double tau = std::floor(t / 9.0) * 6.0 + std::min(std::fmod(t, 9.0), 6.0);
+            // move ~6.5 s, hold still ~2.5 s (lets the second base station bootstrap); smootherstep easing keeps
+            // velocity and acceleration continuous, so the simulated accelerometer stays physical
+            double s = std::min(std::fmod(t, 9.0) / 6.5, 1.0);
+            double ease = s * s * s * (10 - 15 * s + 6 * s * s);
+            double tau = std::floor(t / 9.0) * 6.0 + 6.0 * ease;
             double a = tau * (0.35 + 0.1 * i) + phase;
             Vec3 p = centre + Vec3{0.25 * std::cos(a), 0.06 * std::sin(2 * a), 0.25 * std::sin(a)};
             Quat q = Quat::FromRotVec({0.25 * std::sin(a * 0.7), a, 0.2 * std::cos(a * 0.9)});
@@ -199,7 +202,7 @@ public:
             rt.nextSync = 0.01 * kTicks + (double)(rng_() % 1000) * 1e-3 * rt.period;
             bases_.push_back(rt);
         }
-        clock0_ = 5.0 * kTicks;   // device clock starts at 5 s
+        clock0_ = kDeviceClockStart * kTicks;
         nextImu_ = 0;
     }
     const io::SourceInfo& Info() const override { return info_; }
@@ -277,8 +280,13 @@ private:
     }
 
     void EmitImu(double t) {
-        Pose p = dev_.trajectory(t / kTicks);
-        Vec3 g = p.rot.Conj().Rotate({0, 9.80665, 0});   // accelerometer at rest reads "up"
+        const double ts = t / kTicks;
+        Pose p = dev_.trajectory(ts);
+        // specific force = linear acceleration + "up" (an accelerometer at rest reads +g upwards), device frame
+        const double ha = 0.004;
+        Vec3 acc = (dev_.trajectory(ts + ha).pos + dev_.trajectory(ts - ha).pos - p.pos * 2.0) / (ha * ha);
+        std::normal_distribution<double> an(0, cfg_.accNoise), gn(0, cfg_.gyroNoise);
+        Vec3 g = p.rot.Conj().Rotate(acc + Vec3{0, 9.80665, 0}) + Vec3{an(rng_), an(rng_), an(rng_)};
         uint32_t t32 = Dev32(t) & 0xFFFFFF00u;
         uint8_t pl[16];
         size_t n = 0;
@@ -290,10 +298,10 @@ private:
             pl[n++] = (uint8_t)(a[k] >> 8);
         }
         // gyro: angular velocity in the device frame from the trajectory
-        const double hdt = 0.002;
-        Pose p2 = dev_.trajectory(t / kTicks + hdt);
-        Vec3 wWorld = (p2.rot * p.rot.Conj()).ToRotVec() / hdt;
-        Vec3 wDev = p.rot.Conj().Rotate(wWorld);
+        const double hdt = 0.001;
+        Pose p2 = dev_.trajectory(ts + hdt), p0 = dev_.trajectory(ts - hdt);
+        Vec3 wWorld = (p2.rot * p0.rot.Conj()).ToRotVec() / (2 * hdt);
+        Vec3 wDev = p.rot.Conj().Rotate(wWorld) + cfg_.gyroBias + Vec3{gn(rng_), gn(rng_), gn(rng_)};
         int16_t gy[3] = {(int16_t)std::lround(wDev.x / kGyroPerLsb), (int16_t)std::lround(wDev.y / kGyroPerLsb), (int16_t)std::lround(wDev.z / kGyroPerLsb)};
         for (int k = 0; k < 3; ++k) {
             pl[n++] = (uint8_t)gy[k];
@@ -332,10 +340,19 @@ private:
             if (std::fabs(std::atan2(pb.x, -pb.z)) > 75 * math::kPi / 180 || std::fabs(std::atan2(pb.y, -pb.z)) > 55 * math::kPi / 180) continue;
             for (int plane = 0; plane < 2; ++plane) {
                 if (uni(rng_) < cfg_.missProbability) continue;
-                double ang = lighthouse::ReprojectAxis(rt.b.cal.axis[plane], pb, plane) + noise(rng_);
+                // The plane hits the sensor where the device is *at the hit time*, which depends on the angle:
+                // iterate (pose at sync -> hit time -> pose at hit time -> ...); converges in 2-3 steps.
+                double ang = lighthouse::ReprojectAxis(rt.b.cal.axis[plane], pb, plane);
+                double ts = tSync;
+                for (int it = 0; it < 3; ++it) {
+                    ts = tSync + (ang + (plane ? 4.0 : 2.0) / 3.0 * math::kPi) / (2 * math::kPi) * rt.period;
+                    Vec3 pbt = baseInv.Apply(dev_.trajectory(ts / kTicks).Apply(geo_.points[s]));
+                    ang = lighthouse::ReprojectAxis(rt.b.cal.axis[plane], pbt, plane);
+                }
+                ang += noise(rng_);
                 double raw = ang + (plane ? 4.0 : 2.0) / 3.0 * math::kPi;
                 if (raw < 0 || raw >= 2 * math::kPi) continue;
-                double ts = tSync + raw / (2 * math::kPi) * rt.period;
+                ts = tSync + raw / (2 * math::kPi) * rt.period;
                 uint32_t s24 = Dev32(ts) & 0xFFFFFF;
                 entries.push_back({ts, ((uint32_t)ReportedId(dev_, (int)s) << 27) | (s24 << 3) | 0x2});
             }

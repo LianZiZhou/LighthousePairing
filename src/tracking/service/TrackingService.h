@@ -42,6 +42,8 @@ public:
 
     void ResetWorld();
     void SetReferenceHeight(double metres);
+    /// Refine the world "up" with the accelerometers of still devices (on by default).
+    void SetUseDeviceTilt(bool on);
     /// Put the floor at the lowest sensor of this device (device lying on the floor).
     bool SetFloorFromDevice(const std::string& receiverSerial);
 
@@ -52,9 +54,11 @@ private:
     void Discover();
     void Publish();
     void Log(const std::string& msg);
+    void MaybeSaveUniverse();
 
     std::shared_ptr<model::ModelProvider> models_;
     SharedWorld world_;
+    int knownUniverses_ = 0;   // guarded by world_.mutex
     // Lock order: mtx_ -> pipeline mutex -> world_.mutex; logMtx_ is a leaf.
     mutable std::mutex mtx_;   // pipelines_, options_, recorder_, replay state
     std::map<std::string, std::unique_ptr<DevicePipeline>> pipelines_;   // key: source serial / id
