@@ -22,6 +22,9 @@ enum class LogLevel { Debug, Info, Event, Warning, Error, Command };
 /// What kind of tracked device is on a receiver. Decides how it can be identified:
 /// controllers have a haptic motor, trackers (VIVE / Tundra) do not.
 enum class DeviceClass { Unknown, IndexController, ViveWand, ViveTracker, TundraTracker };
+/// Where a device's identity came from: read from the device itself, or SteamVR's on-disk cache.
+enum class ConfigSource { None, Device, SteamVrCache };
+const char* ToString(ConfigSource s);
 
 const char* ToString(DeviceClass c);
 inline bool CanVibrate(DeviceClass c) { return c == DeviceClass::IndexController || c == DeviceClass::ViveWand; }
@@ -108,7 +111,16 @@ struct DeviceInfo {
     int64_t connectedSince = 0;
     DeviceClass deviceClass = DeviceClass::Unknown;
     Hand hand = Hand::Unknown;
-    bool serialFromEvent = false;   // serial came from "LHR-x: Connected to receiver Y" (authoritative)
+    bool serialFromEvent = false;   // serial confirmed by a connect event or the device config (authoritative)
+
+    // Identity from the device's own JSON config (downloadconfig / SteamVR cache).
+    ConfigSource configSource = ConfigSource::None;
+    std::string manufacturer;       // "HTC" / "Valve" / "Tundra Labs"
+    std::string renderModel;        // "{htc}vr_tracker_vive_3_0"
+    std::string configClass;        // device_class: controller / generic_tracker
+    std::string controllerRole;     // tracked_controller_role
+    std::string trackerRole;        // SteamVR tracker role assignment (TrackerRole_Waist ...)
+    std::vector<std::pair<std::string, std::string>> configProps;   // top-level scalar fields
 };
 
 const char* ToString(Hand h);

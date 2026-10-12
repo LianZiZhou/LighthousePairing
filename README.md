@@ -3,6 +3,7 @@
 一个 C++20 + Dear ImGui (v1.92.9b docking) 的 Windows 桌面工具，用来：
 
 - **列出所有 Lighthouse 接收器**：头显内置的 Watchman、外置 Valve VR Radio (28DE:2102)、老款 Watchman 接收器 (28DE:2101)，按类型分组显示。
+- **设备身份**：设备上线后用 `downloadconfig` 读取设备自身的 JSON 配置（与 SteamVR 读取的相同），得到准确的序列号、产品名（如 `VIVE Tracker 3.0 MV`、`Knuckles Left`）、制造商、渲染模型和左右手；读取失败时用 SteamVR 缓存 `config\lighthouse\<序列号>\config.json`，追踪器角色取自 `steamvr.vrsettings`。
 - **查看配对关系与设备详情**：每个接收器当前连接 / 历史配对的设备（LHR-xxxxxxxx）、型号、固件、硬件版本、电量，以及 `deviceinfo` / `version` 的全部原始字段。
 - **实时信号**：IMU 采样率、包间隔与抖动 σ、USB 包率与最大间隔、无线丢包（keepalive "Packet received after Xs"）、断开、追踪重置；1/5/15 分钟曲线 + 事件表 + 信号质量评分；“信号总览”表格同时看所有接收器。
 - **USB 拓扑**：从 PCI 控制器 → Hub → 接收器的完整链路、端口号、位置路径、驱动、HID 接口、同 Hub 设备，并据此自动判断“头显内置 / 外置”（可手动修正）。

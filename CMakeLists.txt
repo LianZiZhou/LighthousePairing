@@ -52,6 +52,7 @@ target_link_libraries(imgui PUBLIC freetype d3d11 dxgi d3dcompiler)
 add_library(lhp_core STATIC
     src/util/Text.cpp
     src/backend/ConsoleParser.cpp
+    src/backend/DeviceConfig.cpp
     src/backend/ConsoleSession.cpp
     src/backend/UsbTopology.cpp
     src/backend/SystemInfo.cpp

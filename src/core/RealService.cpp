@@ -1,6 +1,7 @@
 // Real backend: drives lighthouse_console.exe, USB topology and process scanning.
 #include "backend/ConsoleParser.h"
 #include "backend/ConsoleSession.h"
+#include "backend/DeviceConfig.h"
 #include "backend/SystemInfo.h"
 #include "backend/UsbTopology.h"
 #include "core/Service.h"
@@ -84,6 +85,12 @@ public:
         wantDeviceInfo_ = true;
         cv_.notify_all();
     }
+    /// Re-read the device's JSON config (serial, product name ...) on the next poll.
+    void RequestConfig() {
+        wantConfig_ = true;
+        wantDeviceInfo_ = true;
+        cv_.notify_all();
+    }
 
 private:
     void Run(std::stop_token st);
@@ -98,6 +105,13 @@ private:
     std::mutex waitMtx_;
     std::condition_variable_any cv_;
     std::atomic<bool> wantDeviceInfo_{true};
+    std::atomic<bool> wantConfig_{false};
+    // Identity of the device last seen online. A receiver holds exactly one pairing, so when the
+    // IMU stream comes back after a dip it is the same device - keep its serial instead of
+    // falling back to "reading". A connect event naming another serial replaces it.
+    std::optional<DeviceInfo> lastIdentity_;
+    double lastConfigTry_ = -1e9;
+    int configTries_ = 0;
 };
 
 // ============================================================================ RealService
@@ -157,6 +171,16 @@ public:
 
     // ---- used by Monitor
     std::wstring ConsoleExe() const { return ToWide(consolePath_); }
+    /// SteamVR tracker role assignments, re-read from steamvr.vrsettings at most every 10 s.
+    std::map<std::string, std::string> TrackerRoles() {
+        std::scoped_lock lk(rolesMtx_);
+        double now = NowSeconds();
+        if (now - rolesReadAt_ > 10.0) {
+            roles_ = devcfg::ParseTrackerRoles(sys::ReadSteamVrSettings());
+            rolesReadAt_ = now;
+        }
+        return roles_;
+    }
     HistoryDb& History() { return history_; }
     void HandleConsoleLine(const std::string& receiver, const std::string& line, bool fromMonitor);
 
@@ -204,6 +228,10 @@ private:
     std::atomic<uint64_t> opSeq_{0};
     std::mutex opLinesMtx_;
     std::vector<std::string> opLines_;
+
+    std::mutex rolesMtx_;
+    std::map<std::string, std::string> roles_;
+    double rolesReadAt_ = -1e9;
 };
 
 // ---------------------------------------------------------------------------- monitor impl
@@ -318,6 +346,65 @@ void Monitor::PollOnce(ConsoleSession& s, bool& online, double& lastBattery, dou
     bool justOffline = !nowOnline && online;
     online = nowOnline;
 
+    // ---- device identity bookkeeping (before fetching, so we know what to ask for)
+    bool needConfig = false;
+    std::string knownSerial;
+    svc_.store.With([&](AppState& st) {
+        Receiver* r = st.Find(serial_);
+        if (!r) return;
+        if (justOffline) {
+            if (r->device) lastIdentity_ = *r->device;
+            SignalEvent ev{now, UnixNow(), SignalEvent::Type::Disconnected, 0, "设备离线（IMU 数据停止）"};
+            Store::PushEvent(*r, ev);
+            Store::LogUnlocked(st, LogLevel::Event, serial_, "设备离线");
+            r->device.reset();
+        }
+        if (justOnline) {
+            if (!r->device) {
+                r->device = lastIdentity_ ? *lastIdentity_ : DeviceInfo{};
+                r->device->batteryPct.reset();
+                r->device->charging.reset();
+            }
+            r->device->connectedSince = UnixNow();
+            SignalEvent ev{now, UnixNow(), SignalEvent::Type::Connected, 0, "设备上线（IMU 数据开始流入）"};
+            Store::PushEvent(*r, ev);
+            Store::LogUnlocked(st, LogLevel::Event, serial_, "设备上线");
+        }
+        if (online && r->device) {
+            knownSerial = r->device->serial;
+            bool have = r->device->configSource == ConfigSource::Device;
+            double retry = configTries_ < 3 ? 8.0 : 120.0;
+            needConfig = wantConfig_.load() || (!have && now - lastConfigTry_ > retry);
+        }
+    });
+
+    // ---- the device's own JSON config: exact serial + product name (same data SteamVR uses)
+    std::optional<devcfg::DeviceConfig> cfg;
+    ConfigSource cfgSource = ConfigSource::None;
+    if (needConfig) {
+        wantConfig_ = false;
+        lastConfigTry_ = now;
+        ++configTries_;
+        std::string path = sys::ConsoleTempFile("lhp_config_" + serial_ + ".json");
+        sys::DeleteFileUtf8(path);
+        if (s.Execute("downloadconfig \"" + path + "\"", nullptr, 12.0, nullptr)) {
+            auto c = devcfg::Parse(sys::ReadTextFile(path));
+            if (c.ok) {
+                cfg = std::move(c);
+                cfgSource = ConfigSource::Device;
+                configTries_ = 0;
+            }
+        }
+        sys::DeleteFileUtf8(path);
+        if (!cfg && !knownSerial.empty()) {
+            auto c = devcfg::Parse(sys::ReadCachedDeviceConfig(knownSerial));
+            if (c.ok && IEquals(c.serial, knownSerial)) {
+                cfg = std::move(c);
+                cfgSource = ConfigSource::SteamVrCache;
+            }
+        }
+    }
+
     std::vector<std::string> info, version, battery;
     bool fetchInfo = online && (justOnline || wantDeviceInfo_.exchange(false) || now - lastInfo > 30.0);
     if (!online) wantDeviceInfo_ = false;
@@ -332,6 +419,8 @@ void Monitor::PollOnce(ConsoleSession& s, bool& online, double& lastBattery, dou
         lastBattery = now;
         s.Execute("battery", &battery, 3.0, nullptr);
     }
+    std::optional<std::map<std::string, std::string>> roles;
+    if (fetchInfo || needConfig) roles = svc_.TrackerRoles();
 
     std::string recordDevice, recordModel;
     svc_.store.With([&](AppState& st) {
@@ -354,24 +443,27 @@ void Monitor::PollOnce(ConsoleSession& s, bool& online, double& lastBattery, dou
         r->pendingGap = 0;
         Store::PushSample(*r, sample);
 
-        if (justOnline) {
-            if (!r->device) r->device = DeviceInfo{};
-            r->device->connectedSince = UnixNow();
-            SignalEvent ev{now, UnixNow(), SignalEvent::Type::Connected, 0, "设备上线（IMU 数据开始流入）"};
-            Store::PushEvent(*r, ev);
-            Store::LogUnlocked(st, LogLevel::Event, serial_, "设备上线");
-        }
-        if (justOffline) {
-            SignalEvent ev{now, UnixNow(), SignalEvent::Type::Disconnected, 0, "设备离线（IMU 数据停止）"};
-            Store::PushEvent(*r, ev);
-            Store::LogUnlocked(st, LogLevel::Event, serial_, "设备离线");
-            r->device.reset();
-        }
         if (r->state != LinkState::Pairing && r->state != LinkState::Busy) r->state = online ? LinkState::Online : LinkState::Idle;
 
         if (online) {
             if (!r->device) r->device = DeviceInfo{};
             DeviceInfo& d = *r->device;
+            if (cfg) {
+                if (cfgSource == ConfigSource::Device && !cfg->serial.empty() && !d.serial.empty() && !IEquals(cfg->serial, d.serial)) {
+                    // A different device than we assumed: start from a clean slate.
+                    DeviceInfo fresh;
+                    fresh.connectedSince = d.connectedSince;
+                    d = std::move(fresh);
+                }
+                devcfg::ApplyTo(*cfg, d, cfgSource);
+                if (cfgSource == ConfigSource::Device) {
+                    Store::LogUnlocked(st, LogLevel::Info, serial_, "设备配置: " + d.serial + " · " + devcfg::ProductName(d) + (d.renderModel.empty() ? "" : " · " + d.renderModel));
+                }
+            }
+            if (roles) {
+                auto it = roles->find(d.serial);
+                d.trackerRole = it == roles->end() ? std::string() : it->second;
+            }
             // deviceinfo lists *every* device the console can see, including wired ones such as the
             // HMD's own lighthouse module (LHR-BB18B08E on a Pimax). Never take those, nor serials
             // that a connect event already tied to another receiver.
@@ -397,19 +489,28 @@ void Monitor::PollOnce(ConsoleSession& s, bool& online, double& lastBattery, dou
                 auto kv = parser::ParseKeyValues(section);
                 d.props = kv;
                 std::string model = parser::GuessModel(kv, d.serial);
-                if (!model.empty()) d.model = model;
+                if (!model.empty() && d.configSource == ConfigSource::None) d.model = model;
             }
             if (!version.empty()) {
                 d.rawVersion = version;
                 auto kv = parser::ParseKeyValues(version);
                 for (auto& p : kv) {
+                    // "Watchman Version: 1592875850 watchman@valvebuilder01 2020-06-23 FPGA 538(2.26/7/2) BL 0 VRC … Radio …"
+                    if (d.firmware.empty() && Contains(p.first, "Watchman Version")) {
+                        static const std::regex re(R"(^(\d+)\s+\S+\s+(\d{4}-\d{2}-\d{2}))");
+                        std::smatch m;
+                        std::string v = p.second;
+                        d.firmware = std::regex_search(v, m, re) ? m.str(1) + "（" + m.str(2) + "）" : v;
+                    }
                     if (d.firmware.empty() && (Contains(p.first, "Firmware") || Contains(p.first, "firmware") || Contains(p.second, "Firmware")))
                         d.firmware = p.second.empty() ? p.first : p.second;
                     if (d.hardware.empty() && (Contains(p.first, "Hardware") || Contains(p.first, "hardware"))) d.hardware = p.second;
                     if (d.hardware.empty() && StartsWith(Trim(p.second), "0x")) d.hardware = std::string(Trim(p.second));   // "0x110e0109 product 17 rev …"
                 }
             }
-            if (!info.empty() || !version.empty() || d.deviceClass == DeviceClass::Unknown) {
+            if (d.configSource != ConfigSource::None) {
+                if (d.deviceClass != DeviceClass::Unknown) r->pairedClass = d.deviceClass;   // class / hand come from the config
+            } else if (!info.empty() || !version.empty() || d.deviceClass == DeviceClass::Unknown) {
                 d.deviceClass = parser::ClassifyDevice(d, r->pairedModel);
                 if (d.model.empty() && d.deviceClass != DeviceClass::Unknown) d.model = ToString(d.deviceClass);
                 if (d.deviceClass != DeviceClass::Unknown) r->pairedClass = d.deviceClass;
@@ -421,10 +522,10 @@ void Monitor::PollOnce(ConsoleSession& s, bool& online, double& lastBattery, dou
                 d.charging = b.charging;
                 d.batteryText = b.notProvided ? "设备未提供电量" : b.text;
             }
-            if (!d.serial.empty() && (r->pairedSerial != d.serial || r->pairingSource != PairingSource::Device)) {
+            if (!d.serial.empty() && (r->pairedSerial != d.serial || r->pairedModel != d.model)) {
                 r->pairedSerial = d.serial;
                 r->pairedModel = d.model;
-                r->pairingSource = PairingSource::Session;
+                r->pairingSource = d.serialFromEvent ? PairingSource::Device : PairingSource::Session;
                 r->pairedLastSeen = UnixNow();
                 recordDevice = d.serial;
                 recordModel = d.model;
@@ -450,6 +551,7 @@ void RealService::HandleConsoleLine(const std::string& receiver, const std::stri
     if (std::holds_alternative<std::monostate>(ev) && parser::IsPollNoise(line)) return;
     std::string recordDevice;
     std::string recordReceiver;
+    bool needConfig = false;
     store.With([&](AppState& s) {
         LogLevel lvl = std::holds_alternative<std::monostate>(ev) ? LogLevel::Debug : LogLevel::Event;
         if (parser::LooksLikeError(line)) lvl = LogLevel::Warning;
@@ -472,6 +574,8 @@ void RealService::HandleConsoleLine(const std::string& receiver, const std::stri
                     if (auto* r = target(e.receiver)) {
                         Store::PushEvent(*r, {now, UnixNow(), SignalEvent::Type::Connected, 0, e.device + " 已连接"});
                         if (!r->device) r->device = DeviceInfo{};
+                        if (!r->device->serial.empty() && !IEquals(r->device->serial, e.device)) r->device = DeviceInfo{};   // another device
+                        if (r->device->configSource != ConfigSource::Device) needConfig = true;
                         r->device->serial = e.device;
                         r->device->serialFromEvent = true;
                         r->device->connectedSince = UnixNow();
@@ -500,7 +604,10 @@ void RealService::HandleConsoleLine(const std::string& receiver, const std::stri
     });
     if (!recordDevice.empty()) {
         history_.RecordPairing(recordReceiver, recordDevice, "", "连接事件");
-        if (auto* m = GetMonitor(recordReceiver)) m->RequestDeviceInfo();
+        if (auto* m = GetMonitor(recordReceiver)) {
+            if (needConfig) m->RequestConfig();
+            else m->RequestDeviceInfo();
+        }
     }
 }
 
@@ -574,6 +681,9 @@ void RealService::Handle(const Command& c) {
         case T::Identify: StartOp(OpKind::Identify, c.serial, "", 10); break;
         case T::PowerOff: StartOp(OpKind::PowerOff, c.serial, "", 10); break;
         case T::CancelOp: opCancel_ = true; break;
+        case T::ReloadDevice:
+            if (auto* m = GetMonitor(c.serial)) m->RequestConfig();
+            break;
         case T::SetFastPoll:
             store.With([&](AppState& s) { s.fastPoll = c.value != 0; });
             break;
@@ -753,6 +863,29 @@ void RealService::DoRefresh() {
         Store::LogUnlocked(s, LogLevel::Info, "main",
                            "刷新完成: " + std::to_string(receiversListed.size()) + " 个接收器 (console), " + std::to_string(dongles.size()) + " 条 dongleinfo");
     });
+
+    // Offline devices: take the product name from SteamVR's cached device config, if it has one.
+    std::vector<std::string> need;
+    store.With([&](AppState& s) {
+        for (auto& r : s.receivers)
+            if (r.kind != ReceiverKind::Wired && !r.pairedSerial.empty() && (r.pairedModel.empty() || r.pairedClass == DeviceClass::Unknown))
+                need.push_back(r.pairedSerial);
+    });
+    std::map<std::string, devcfg::DeviceConfig> cached;
+    for (auto& sn : need)
+        if (auto c = devcfg::Parse(sys::ReadCachedDeviceConfig(sn)); c.ok && IEquals(c.serial, sn)) cached[sn] = std::move(c);
+    if (!cached.empty()) {
+        store.With([&](AppState& s) {
+            for (auto& r : s.receivers) {
+                auto it = cached.find(r.pairedSerial);
+                if (it == cached.end()) continue;
+                DeviceInfo t;
+                devcfg::ApplyTo(it->second, t, ConfigSource::SteamVrCache);
+                if (!t.model.empty()) r.pairedModel = t.model;
+                if (t.deviceClass != DeviceClass::Unknown) r.pairedClass = t.deviceClass;
+            }
+        });
+    }
 }
 
 void RealService::MergeUsb(const std::vector<UsbReceiver>& list) {

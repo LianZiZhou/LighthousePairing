@@ -1,3 +1,4 @@
+#include "backend/DeviceConfig.h"
 #include "backend/SystemInfo.h"
 #include "imgui_internal.h"
 #include "implot.h"
@@ -47,8 +48,28 @@ ImVec4 KindColor(ReceiverKind k) {
 
 /// Device line text: "Valve Index 手柄（左手）" when known, else raw model.
 std::string ModelText(const DeviceInfo& d) {
-    if (d.deviceClass != DeviceClass::Unknown) return DeviceDisplayModel(d);
-    return d.model;
+    std::string m;
+    if (d.configSource != ConfigSource::None && !d.model.empty()) m = d.model;   // product name the device reports
+    else if (d.deviceClass != DeviceClass::Unknown) m = DeviceDisplayModel(d);
+    else m = d.model;
+    if (!d.trackerRole.empty()) m += " · " + devcfg::TrackerRoleText(d.trackerRole);
+    return m;
+}
+
+/// Axis top with ~15% headroom above `v`, rounded to 1/1.2/1.5/2/2.5/3/4/5/6/8 x 10^n.
+double NiceAxisTop(double v, double minTop) {
+    v = std::max(v, minTop) * 1.15;
+    double mag = std::pow(10.0, std::floor(std::log10(v)));
+    for (double m : {1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0})
+        if (m * mag >= v - 1e-9) return m * mag;
+    return 10 * mag;
+}
+
+std::string RoleText(const DeviceInfo& d) {
+    std::string out;
+    if (!d.controllerRole.empty()) out = d.controllerRole == "LeftHand" ? "左手 (LeftHand)" : d.controllerRole == "RightHand" ? "右手 (RightHand)" : d.controllerRole;
+    if (!d.trackerRole.empty()) out += (out.empty() ? "" : " / ") + devcfg::TrackerRoleText(d.trackerRole) + " (" + d.trackerRole + ")";
+    return out;
 }
 
 ImVec4 QualityColor(int q) {
@@ -549,11 +570,15 @@ void App::DrawTabOverview(AppState& s, Receiver& r) {
         ImGui::Spacing();
         if (BeginPropTable("##dev")) {
             if (r.device) {
-                PropRow("序列号", r.device->serial.empty() ? "（读取中）" : r.device->serial, true, &p.success);
-                PropRow("型号", r.device->model);
-                PropRow("设备类型", ToString(r.device->deviceClass));
-                if (r.device->deviceClass == DeviceClass::IndexController)
-                    PropRow("左 / 右手", r.device->hand == Hand::Unknown ? "未能判断" : ToString(r.device->hand));
+                const DeviceInfo& dv = *r.device;
+                PropRow("序列号", dv.serial.empty() ? "（读取中）" : dv.serial, true, &p.success);
+                PropRow("产品名", devcfg::ProductName(dv));
+                PropRow("设备类型", ToString(dv.deviceClass));
+                if (dv.deviceClass == DeviceClass::IndexController || dv.deviceClass == DeviceClass::ViveWand)
+                    PropRow("左 / 右手", dv.hand == Hand::Unknown ? "未能判断" : ToString(dv.hand));
+                if (std::string role = RoleText(dv); !role.empty()) PropRow("SteamVR 角色", role);
+                if (!dv.renderModel.empty()) PropRow("渲染模型", dv.renderModel, true);
+                PropRow("身份来源", ToString(dv.configSource));
                 PropRow("识别方式", CanVibrate(r.device->deviceClass) ? "震动（有触觉马达）"
                                     : IsTracker(r.device->deviceClass) ? "摇一摇 / 关机看指示灯（追踪器没有震动马达）"
                                                                        : "类型未知：先试摇一摇");
@@ -713,10 +738,23 @@ void App::DrawTabSignal(AppState& s, Receiver& r) {
         ImPlot::SetupAxisFormat(ImAxis_X1, SecondsAgoFormatter, nullptr);
     };
     int cnt = (int)xs.size();
+    // Y axes: 0 .. a "nice" value above the visible maximum, recomputed every frame. ImPlot's
+    // AutoFit puts the maximum exactly on the frame edge, so peaks and markers got clipped.
+    auto maxOf = [](std::initializer_list<const std::vector<double>*> vs) {
+        double m = 0;
+        for (auto* v : vs)
+            for (double x : *v)
+                if (std::isfinite(x)) m = std::max(m, x);
+        return m;
+    };
+    auto setupY = [&](ImAxis axis, const char* label, double maxValue, double minTop, ImPlotAxisFlags extra = 0) {
+        ImPlot::SetupAxis(axis, label, extra | ImPlotAxisFlags_LockMin);
+        ImPlot::SetupAxisLimits(axis, 0, NiceAxisTop(maxValue, minTop), ImPlotCond_Always);
+    };
     if (ImPlot::BeginPlot("##imu", ImVec2(-1, plotH), ImPlotFlags_NoMenus | ImPlotFlags_NoBoxSelect)) {
         setupX();
-        ImPlot::SetupAxis(ImAxis_Y1, "IMU Hz", ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_RangeFit);
-        ImPlot::SetupAxis(ImAxis_Y2, "丢包 s", ImPlotAxisFlags_AuxDefault | ImPlotAxisFlags_AutoFit);
+        setupY(ImAxis_Y1, "IMU Hz", maxOf({&imu}), 10);
+        setupY(ImAxis_Y2, "丢包 s", maxOf({&gy}), 0.05, ImPlotAxisFlags_AuxDefault);
         ImPlot::SetupLegend(ImPlotLocation_NorthWest, ImPlotLegendFlags_Horizontal);
         if (cnt) {
             ImPlot::PlotShaded("IMU 速率", xs.data(), imu.data(), cnt, 0.0, Fill(p.plotImu, 0.18f));
@@ -734,7 +772,7 @@ void App::DrawTabSignal(AppState& s, Receiver& r) {
     }
     if (ImPlot::BeginPlot("##jit", ImVec2(-1, plotH * 0.85f), ImPlotFlags_NoMenus | ImPlotFlags_NoBoxSelect)) {
         setupX();
-        ImPlot::SetupAxis(ImAxis_Y1, "ms", ImPlotAxisFlags_AutoFit);
+        setupY(ImAxis_Y1, "ms", maxOf({&interval, &sigma}), 1);
         ImPlot::SetupLegend(ImPlotLocation_NorthWest, ImPlotLegendFlags_Horizontal);
         if (cnt) {
             ImPlot::PlotLine("平均间隔", xs.data(), interval.data(), cnt, Line(p.info, 1.6f));
@@ -745,8 +783,8 @@ void App::DrawTabSignal(AppState& s, Receiver& r) {
     }
     if (ImPlot::BeginPlot("##usb", ImVec2(-1, plotH * 0.85f), ImPlotFlags_NoMenus | ImPlotFlags_NoBoxSelect)) {
         setupX();
-        ImPlot::SetupAxis(ImAxis_Y1, "包/秒", ImPlotAxisFlags_AutoFit);
-        ImPlot::SetupAxis(ImAxis_Y2, "最大间隔 ms", ImPlotAxisFlags_AuxDefault | ImPlotAxisFlags_AutoFit);
+        setupY(ImAxis_Y1, "包/秒", maxOf({&usb}), 10);
+        setupY(ImAxis_Y2, "最大间隔 ms", maxOf({&usbMax}), 5, ImPlotAxisFlags_AuxDefault);
         ImPlot::SetupLegend(ImPlotLocation_NorthWest, ImPlotLegendFlags_Horizontal);
         if (cnt) {
             ImPlot::PlotLine("USB 包率", xs.data(), usb.data(), cnt, Line(p.plotUsb, 1.8f));
@@ -831,10 +869,15 @@ void App::DrawTabDevice(AppState& s, Receiver& r) {
         const float fsz = ImGui::GetFontSize();
         const float lineH = fsz * BigScale(1.3f);
         auto centerOnLine = [&](float itemH) { ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (lineH - itemH) * 0.5f); };
-        if (!d.model.empty()) {
+        if (std::string product = devcfg::ProductName(d); !product.empty()) {
             ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x * 2);
             centerOnLine(ImGui::GetFrameHeight());
-            Chip(d.model.c_str(), p.accent);
+            Chip(product.c_str(), p.accent);
+        }
+        if (!d.trackerRole.empty()) {
+            ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x);
+            centerOnLine(ImGui::GetFrameHeight());
+            Chip(devcfg::TrackerRoleText(d.trackerRole).c_str(), p.info);
         }
         if (d.batteryPct) {
             ImGui::SameLine(0, fsz);
@@ -847,10 +890,12 @@ void App::DrawTabDevice(AppState& s, Receiver& r) {
         }
         TextDim("连接在 %s · 已连接 %s", r.serial.c_str(), d.connectedSince ? FormatAgo(d.connectedSince).c_str() : "—");
         ImGui::SameLine();
-        if (ImGui::SmallButton(ICON_REFRESH " 重新读取")) Post({Command::Type::RawCommand, r.serial, "deviceinfo"});
+        if (ImGui::SmallButton(ICON_REFRESH " 重新读取")) Post({Command::Type::ReloadDevice, r.serial});
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("重新从设备读取配置（downloadconfig）、deviceinfo 和 version");
         ImGui::SameLine();
         if (ImGui::SmallButton(ICON_COPY " 复制全部")) {
             std::string all = "Receiver: " + r.serial + "\n";
+            for (auto& [k, v] : d.configProps) all += k + ": " + v + "\n";
             for (auto& [k, v] : d.props) all += (k.empty() ? "" : k + ": ") + v + "\n";
             for (auto& l : d.rawVersion) all += l + "\n";
             all += "Battery: " + d.batteryText + "\n";
@@ -859,6 +904,30 @@ void App::DrawTabDevice(AppState& s, Receiver& r) {
         }
     }
     EndCard();
+    ImGui::Spacing();
+    SectionTitle(ICON_GAME, "设备身份", d.configSource == ConfigSource::Device ? "（设备自身的配置，与 SteamVR 读取的相同）"
+                                     : d.configSource == ConfigSource::SteamVrCache ? "（来自 SteamVR 缓存，设备读取失败时使用）"
+                                                                                  : "（尚未读取到设备配置）");
+    if (BeginPropTable("##identity", ImGui::GetFontSize() * 11)) {
+        PropRow("序列号", d.serial, true);
+        PropRow("产品名", devcfg::ProductName(d), true);
+        PropRow("制造商", d.manufacturer);
+        PropRow("型号 (model_number)", d.model, true);
+        PropRow("设备类别 (device_class)", d.configClass);
+        PropRow("渲染模型", d.renderModel, true);
+        if (std::string role = RoleText(d); !role.empty()) PropRow("SteamVR 角色", role);
+        PropRow("身份来源", ToString(d.configSource));
+        EndPropTable();
+    }
+    if (!d.configProps.empty()) {
+        ImGui::Spacing();
+        if (ImGui::CollapsingHeader("设备配置的全部字段")) {
+            if (BeginPropTable("##cfgprops", ImGui::GetFontSize() * 11)) {
+                for (auto& [k, v] : d.configProps) PropRow(k.c_str(), v, true);
+                EndPropTable();
+            }
+        }
+    }
     ImGui::Spacing();
     SectionTitle(ICON_INFO, "全部属性", "（deviceinfo / version 原始解析）");
     if (BeginPropTable("##props", ImGui::GetFontSize() * 11)) {

@@ -9,6 +9,20 @@ namespace lhp::sys {
 /// SteamVR runtime directory from %LOCALAPPDATA%\openvr\openvrpaths.vrpath (or registry fallback).
 std::string FindSteamVrRuntime();
 
+/// Steam config directory (openvrpaths.vrpath "config", e.g. C:\Program Files (x86)\Steam\config).
+std::string FindSteamConfigDir();
+
+/// SteamVR's cached copy of a device's JSON config (<config>\lighthouse\<serial>\config.json); empty if none.
+std::string ReadCachedDeviceConfig(const std::string& deviceSerial);
+
+/// Contents of <config>\steamvr.vrsettings (tracker role assignments etc.).
+std::string ReadSteamVrSettings();
+
+/// A temp file path lighthouse_console can write to: no characters outside ASCII
+/// (falls back to the 8.3 short name or %ProgramData%). Quote it, it may contain spaces.
+std::string ConsoleTempFile(const std::string& name);
+bool DeleteFileUtf8(const std::string& path);
+
 /// Full path to lighthouse_console.exe (empty when not found).
 std::string FindLighthouseConsole(const std::string& overridePath);
 

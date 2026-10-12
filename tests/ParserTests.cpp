@@ -177,3 +177,47 @@ TEST_CASE("key values") {
     CHECK(kv[2].first.empty());
     CHECK(GuessModel(kv, "") == "Knuckles Right");
 }
+
+// ---------------------------------------------------------------- device config (downloadconfig / SteamVR cache)
+#include "backend/DeviceConfig.h"
+
+TEST_CASE("device config: VIVE tracker") {
+    // Trimmed real downloadconfig output (serial replaced).
+    auto c = devcfg::Parse(R"({"device_class":"generic_tracker","device_pid":8960,"device_serial_number":"LHR-3A7C0E21",
+        "device_vid":10462,"firmware_config":{"radio":{}},"manufacturer":"HTC","model_number":"VIVE Tracker 3.0 MV",
+        "render_model":"{htc}vr_tracker_vive_3_0","revision":3,"tracked_controller_role":"","type":"Lighthouse_HMD"})");
+    REQUIRE(c.ok);
+    CHECK(c.serial == "LHR-3A7C0E21");
+    CHECK(c.model == "VIVE Tracker 3.0 MV");
+    DeviceInfo d;
+    devcfg::ApplyTo(c, d, ConfigSource::Device);
+    CHECK(d.serialFromEvent);
+    CHECK(d.deviceClass == DeviceClass::ViveTracker);
+    CHECK(devcfg::ProductName(d) == "HTC VIVE Tracker 3.0 MV");
+    CHECK(d.configProps.size() == 10);   // scalars only, firmware_config skipped
+}
+
+TEST_CASE("device config: index controller hand, tundra") {
+    DeviceInfo l;
+    devcfg::ApplyTo(devcfg::Parse(R"({"device_class":"controller","device_serial_number":"lhr-00c0ffee","manufacturer":"Valve",
+        "model_number":"Knuckles Left","render_model":"{indexcontroller}valve_controller_knu_1_0_left","tracked_controller_role":"LeftHand"})"),
+                    l, ConfigSource::Device);
+    CHECK(l.serial == "LHR-00C0FFEE");
+    CHECK(l.deviceClass == DeviceClass::IndexController);
+    CHECK(l.hand == Hand::Left);
+    CHECK(devcfg::ProductName(l) == "Valve Knuckles Left");
+    DeviceInfo t;
+    devcfg::ApplyTo(devcfg::Parse(R"({"device_class":"generic_tracker","device_serial_number":"LHR-11223344","manufacturer":"Tundra Labs",
+        "model_number":"Tundra Tracker"})"), t, ConfigSource::SteamVrCache);
+    CHECK(t.deviceClass == DeviceClass::TundraTracker);
+    CHECK(devcfg::ProductName(t) == "Tundra Tracker");
+    CHECK_FALSE(devcfg::Parse("not json").ok);
+}
+
+TEST_CASE("tracker roles from steamvr.vrsettings") {
+    auto roles = devcfg::ParseTrackerRoles(R"({"steamvr":{},"trackers":{"/devices/htc/vive_trackerLHR-3A7C0E21":"TrackerRole_Waist",
+        "/devices/htc/vive_trackerLHR-11223344":"TrackerRole_LeftFoot"}})");
+    CHECK(roles.size() == 2);
+    CHECK(roles["LHR-3A7C0E21"] == "TrackerRole_Waist");
+    CHECK(devcfg::TrackerRoleText(roles["LHR-11223344"]) == "\xE5\xB7\xA6\xE8\x84\x9A");   // "??"
+}

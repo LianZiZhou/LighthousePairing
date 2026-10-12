@@ -42,6 +42,13 @@ const char* ToString(DeviceClass c) {
         default: return "未知设备";
     }
 }
+const char* ToString(ConfigSource s) {
+    switch (s) {
+        case ConfigSource::Device: return "从设备读取 (downloadconfig)";
+        case ConfigSource::SteamVrCache: return "SteamVR 缓存";
+        default: return "未读取";
+    }
+}
 const char* ToString(Hand h) {
     switch (h) {
         case Hand::Left: return "左手";

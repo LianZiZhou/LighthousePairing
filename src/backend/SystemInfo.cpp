@@ -84,6 +84,74 @@ std::string FindSteamVrRuntime() {
     return {};
 }
 
+std::string FindSteamConfigDir() {
+    std::wstring local = KnownFolder(FOLDERID_LocalAppData);
+    std::string text = ReadTextFile(ToUtf8(local + L"\\openvr\\openvrpaths.vrpath"));
+    auto norm = [](std::string p) {
+        for (auto& c : p)
+            if (c == '/') c = '\\';
+        while (!p.empty() && p.back() == '\\') p.pop_back();
+        return p;
+    };
+    if (!text.empty()) {
+        try {
+            auto j = nlohmann::json::parse(text);
+            if (j.contains("config"))
+                for (auto& r : j["config"]) {
+                    std::string p = norm(r.get<std::string>());
+                    if (FileExists(p)) return p;
+                }
+        } catch (...) {
+        }
+    }
+    wchar_t buf[MAX_PATH]{};
+    DWORD size = sizeof buf;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath", RRF_RT_REG_SZ, nullptr, buf, &size) == ERROR_SUCCESS) {
+        std::string p = norm(ToUtf8(buf)) + "\\config";
+        if (FileExists(p)) return p;
+    }
+    return {};
+}
+
+std::string ReadCachedDeviceConfig(const std::string& deviceSerial) {
+    if (deviceSerial.empty()) return {};
+    std::string dir = FindSteamConfigDir();
+    if (dir.empty()) return {};
+    std::string s = deviceSerial;
+    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+    return ReadTextFile(dir + "\\lighthouse\\" + s + "\\config.json");
+}
+
+std::string ReadSteamVrSettings() {
+    std::string dir = FindSteamConfigDir();
+    return dir.empty() ? std::string() : ReadTextFile(dir + "\\steamvr.vrsettings");
+}
+
+std::string ConsoleTempFile(const std::string& name) {
+    auto ascii = [](const std::wstring& w) {
+        return std::all_of(w.begin(), w.end(), [](wchar_t c) { return c < 128; });
+    };
+    wchar_t tmp[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring dir = tmp;
+    if (!ascii(dir)) {
+        wchar_t shortp[MAX_PATH]{};
+        if (GetShortPathNameW(dir.c_str(), shortp, MAX_PATH) && ascii(shortp)) dir = shortp;
+        else {
+            dir = KnownFolder(FOLDERID_ProgramData) + L"\\LighthousePairing\\";
+            std::error_code ec;
+            fs::create_directories(dir, ec);
+        }
+    }
+    if (!dir.empty() && dir.back() != L'\\') dir += L'\\';
+    return ToUtf8(dir) + name;
+}
+
+bool DeleteFileUtf8(const std::string& path) {
+    std::error_code ec;
+    return fs::remove(fs::path(ToWide(path)), ec);
+}
+
 std::string FindLighthouseConsole(const std::string& overridePath) {
     if (!overridePath.empty() && FileExists(overridePath)) return overridePath;
     std::string rt = FindSteamVrRuntime();

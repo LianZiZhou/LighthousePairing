@@ -31,6 +31,7 @@ struct Command {
         RawCommand,
         DismissOp,
         SetFastPoll,   // value = 1 on / 0 off (shake identify)
+        ReloadDevice,  // re-read device config + deviceinfo on that receiver
     } type;
     std::string serial;
     std::string text;

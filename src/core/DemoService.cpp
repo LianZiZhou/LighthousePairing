@@ -1,11 +1,13 @@
 // Demo backend: synthetic receivers and signals (mirrors a real Pimax + Index + 3x Tracker setup).
 // Used for UI development, screenshots and when no hardware is attached.
 #include "backend/ConsoleParser.h"
+#include "backend/DeviceConfig.h"
 #include "backend/SystemInfo.h"
 #include "core/Service.h"
 #include "util/Text.h"
 
 #include <cmath>
+#include <nlohmann/json.hpp>
 #include <random>
 #include <thread>
 
@@ -128,6 +130,29 @@ public:
                             {"Connected Dongle", d.receiver}};
                 di.rawDeviceInfo = {std::string("Device ") + d.device + " (" + d.model + ")"};
                 if (di.deviceClass == DeviceClass::IndexController) di.hand = parser::DetectHand(di);
+                {
+                    // Same shape as the JSON `downloadconfig` returns.
+                    bool tundra = di.deviceClass == DeviceClass::TundraTracker;
+                    nlohmann::json cfg = {
+                        {"device_serial_number", d.device},
+                        {"model_number", d.model},
+                        {"manufacturer", knuckles ? "Valve" : tundra ? "Tundra Labs" : "HTC"},
+                        {"device_class", knuckles ? "controller" : "generic_tracker"},
+                        {"render_model", knuckles ? std::string("{indexcontroller}valve_controller_knu_1_0_") + (rightHand ? "right" : "left")
+                                         : tundra ? "{tundra_labs}tundra_tracker"
+                                                  : "{htc}vr_tracker_vive_3_0"},
+                        {"tracked_controller_role", knuckles ? (rightHand ? "RightHand" : "LeftHand") : ""},
+                        {"resource_root", knuckles ? "indexcontroller" : tundra ? "tundra_labs" : "htc"},
+                        {"revision", knuckles ? 1 : 3},
+                        {"device_vid", 10462},
+                        {"device_pid", knuckles ? 8973 : 8960},
+                    };
+                    devcfg::ApplyTo(devcfg::Parse(cfg.dump()), di, ConfigSource::Device);
+                    std::string nick = d.nickname;
+                    if (nick == "腰") di.trackerRole = "TrackerRole_Waist";
+                    if (nick == "左脚") di.trackerRole = "TrackerRole_LeftFoot";
+                    if (nick == "右脚") di.trackerRole = "TrackerRole_RightFoot";
+                }
                 r.device = di;
                 // pre-fill 5 minutes of history
                 std::mt19937 rng((unsigned)std::hash<std::string>{}(d.receiver));
