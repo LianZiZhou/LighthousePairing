@@ -381,8 +381,23 @@ static int Live(double seconds, const std::string& configPath, bool active, cons
     }
     auto t0 = io::HostMicros();
     size_t logShown = 0;
+    uint64_t lastSeq = 0, lastChange = io::HostMicros();
+    double maxGapMs = 0;
     while ((io::HostMicros() - t0) / 1e6 < seconds) {
-        Sleep(1000);
+        // poll the snapshot for a second, measuring the longest gap between publications (stalls show up here)
+        uint64_t sliceStart = io::HostMicros();
+        maxGapMs = 0;
+        while (io::HostMicros() - sliceStart < 1'000'000) {
+            Sleep(2);
+            auto q = svc.Snapshot();
+            if (q && q->seq != lastSeq) {
+                uint64_t now = io::HostMicros();
+                if (lastSeq) maxGapMs = std::max(maxGapMs, (now - lastChange) / 1000.0);
+                lastSeq = q->seq;
+                lastChange = now;
+            }
+        }
+        std::printf("   snapshot max gap %.0f ms\n", maxGapMs);
         auto s = svc.Snapshot();
         if (!s) continue;
         for (; logShown < s->log.size(); ++logShown) std::printf("  log: %s\n", s->log[logShown].c_str());

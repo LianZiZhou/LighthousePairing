@@ -50,7 +50,8 @@ public:
     SnapshotPtr Snapshot() const;
 
 private:
-    void Loop();
+    void Loop();          // publishes snapshots (~30 Hz); must never block on slow work
+    void Housekeeping();  // discovery, host probe, saving
     void Discover();
     void Publish();
     void Log(const std::string& msg);
@@ -71,9 +72,9 @@ private:
     bool simulated_ = false;
     std::string replayPath_;
 
-    std::thread thread_;
+    std::thread thread_, hkThread_;
     std::atomic<bool> running_{false}, stop_{false};
-    HostState host_;
+    HostState host_;   // guarded by mtx_
     uint64_t seq_ = 0;
     mutable std::mutex snapMtx_;
     SnapshotPtr snapshot_;

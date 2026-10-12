@@ -57,6 +57,7 @@ void TrackingService::Start() {
     running_ = true;
     Log("开始读取原始 HID 数据（被动模式：只读，不向设备发送任何命令）");
     thread_ = std::thread([this] { Loop(); });
+    hkThread_ = std::thread([this] { Housekeeping(); });
 }
 
 bool TrackingService::StartReplay(const std::string& path, std::string* error) {
@@ -96,11 +97,13 @@ void TrackingService::StartSources(std::vector<std::unique_ptr<io::ReportSource>
     running_ = true;
     Log(logLine);
     thread_ = std::thread([this] { Loop(); });
+    hkThread_ = std::thread([this] { Housekeeping(); });
 }
 
 void TrackingService::Stop() {
     stop_ = true;
     if (thread_.joinable()) thread_.join();
+    if (hkThread_.joinable()) hkThread_.join();
     std::map<std::string, std::unique_ptr<DevicePipeline>> doomed;
     {
         std::scoped_lock lk(mtx_);
@@ -199,35 +202,47 @@ bool TrackingService::SetFloorFromDevice(const std::string& serial) {
 }
 
 void TrackingService::Discover() {
+    // Slow work (SetupAPI enumeration, opening handles, joining finished threads) runs without mtx_, so
+    // Publish() on the other thread never waits for it.
     auto list = hid::Enumerate(kValve);
-    std::scoped_lock lk(mtx_);
-    // drop ended pipelines (unplugged)
-    for (auto it = pipelines_.begin(); it != pipelines_.end();) {
-        if (it->second->Ended()) {
-            Log(it->first + " 已断开");
-            it = pipelines_.erase(it);
-        } else {
-            ++it;
+    std::vector<std::unique_ptr<DevicePipeline>> ended;
+    std::vector<hid::HidDeviceInfo> fresh;
+    size_t count = 0;
+    {
+        std::scoped_lock lk(mtx_);
+        for (auto it = pipelines_.begin(); it != pipelines_.end();) {   // unplugged
+            if (it->second->Ended()) {
+                Log(it->first + " 已断开");
+                ended.push_back(std::move(it->second));
+                it = pipelines_.erase(it);
+            } else {
+                ++it;
+            }
         }
+        for (auto& d : list)
+            if (IsReceiver(d.pid) && !d.serial.empty() && !pipelines_.count(d.serial)) fresh.push_back(d);   // wired devices: not supported yet
+        count = pipelines_.size();
     }
-    for (auto& d : list) {
-        if (!IsReceiver(d.pid) || d.serial.empty()) continue;   // wired devices: not supported yet (different report set)
-        if (pipelines_.count(d.serial)) continue;
+    ended.clear();
+    for (auto& d : fresh) {
         std::string err;
-        auto src = io::OpenLive(d, (uint16_t)pipelines_.size(), hid::Access::ReadOnly, &err);
+        auto src = io::OpenLive(d, (uint16_t)count++, hid::Access::ReadOnly, &err);
         if (!src) {
             Log("无法打开 " + d.serial + ": " + err);
             continue;
         }
         PipelineConfig cfg{models_, &world_, [this](const std::string& m) { Log(m); }, d};
         auto p = std::make_unique<DevicePipeline>(std::move(src), cfg);
+        std::scoped_lock lk(mtx_);
+        if (stop_ || replay_ || pipelines_.count(d.serial)) continue;
         if (recorder_) p->SetRecorder(recorder_);
         p->Start();
         pipelines_[d.serial] = std::move(p);
     }
 }
 
-void TrackingService::Loop() {
+void TrackingService::Housekeeping() {
+    // Everything slow and periodic lives here, off the publishing thread (it used to stall snapshots every 2 s).
     auto lastDiscover = std::chrono::steady_clock::now() - std::chrono::seconds(10);
     auto lastHost = lastDiscover;
     auto lastSave = std::chrono::steady_clock::now();
@@ -235,15 +250,14 @@ void TrackingService::Loop() {
         auto now = std::chrono::steady_clock::now();
         if (now - lastHost > std::chrono::seconds(2)) {
             lastHost = now;
-            host_ = ProbeHost();
+            HostState h = ProbeHost();
+            std::scoped_lock lk(mtx_);
+            host_ = h;
         }
         bool replay;
         {
             std::scoped_lock lk(mtx_);
             replay = replay_;
-            std::string reason;
-            bool allowed = !replay_ && options_.activeRequested && ActiveModeAllowed(host_, &reason);
-            for (auto& [k, p] : pipelines_) p->SetActiveAllowed(allowed);
         }
         if (!replay && now - lastDiscover > std::chrono::seconds(2)) {
             lastDiscover = now;
@@ -253,19 +267,30 @@ void TrackingService::Loop() {
             lastSave = now;
             MaybeSaveUniverse();
         }
+        for (int i = 0; i < 10 && !stop_; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+void TrackingService::Loop() {
+    while (!stop_) {
+        {
+            std::scoped_lock lk(mtx_);
+            std::string reason;
+            bool allowed = !replay_ && options_.activeRequested && ActiveModeAllowed(host_, &reason);
+            for (auto& [k, p] : pipelines_) p->SetActiveAllowed(allowed);
+        }
         Publish();
         std::this_thread::sleep_for(std::chrono::milliseconds(33));
     }
 }
-
 void TrackingService::Publish() {
     auto snap = std::make_shared<TrackingSnapshot>();
     snap->seq = ++seq_;
     snap->running = running_;
-    snap->host = host_;
     std::vector<std::pair<std::string, const DevicePipeline*>> pl;
     {
         std::scoped_lock lk(mtx_);
+        snap->host = host_;
         snap->replay = replay_;
         snap->simulated = simulated_;
         snap->replayPath = replayPath_;
