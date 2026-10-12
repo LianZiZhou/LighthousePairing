@@ -80,9 +80,8 @@ ImVec4 QualityColor(int q) {
 const char* QualityText(int q) { return q >= 4 ? "优秀" : q == 3 ? "良好" : q == 2 ? "一般" : q == 1 ? "差" : "—"; }
 
 const char* BatteryIcon(const DeviceInfo& d) {
-    if (d.charging.value_or(false)) return ICON_BATTERY_CHARGING;
-    int v = d.batteryPct.value_or(0);
-    return ICON_BATTERY(std::clamp((v + 5) / 10, 0, 10));
+    int level = std::clamp((d.batteryPct.value_or(0) + 5) / 10, 0, 10);
+    return d.charging.value_or(false) ? ICON_BATTERY_CHARGING(level) : ICON_BATTERY(level);
 }
 
 ImVec4 BatteryColor(int pct) {

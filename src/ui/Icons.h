@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // Segoe Fluent Icons (Windows 11) / Segoe MDL2 Assets (Windows 10) code points, UTF-8 encoded.
 #define ICON_REFRESH    "\xee\x9c\xac"   // E72C
 #define ICON_SETTINGS   "\xee\x9c\x93"   // E713
@@ -44,9 +44,14 @@
 #define ICON_EXPORT     "\xee\xb7\xa1"   // EDE1
 #define ICON_BATTERY(n) ICON_BATTERY_TABLE[(n)]
 
-// Battery0..Battery10 = E850..E85A
+// Segoe MDL2 / Fluent: Battery0..9 = E850..E859, Battery10 = E83F (not E85A - that is BatteryCharging0).
 inline const char* const ICON_BATTERY_TABLE[11] = {
     "\xee\xa1\x90", "\xee\xa1\x91", "\xee\xa1\x92", "\xee\xa1\x93", "\xee\xa1\x94", "\xee\xa1\x95",
-    "\xee\xa1\x96", "\xee\xa1\x97", "\xee\xa1\x98", "\xee\xa1\x99", "\xee\xa1\x9a",
+    "\xee\xa1\x96", "\xee\xa1\x97", "\xee\xa1\x98", "\xee\xa1\x99", "\xee\xa0\xbf",
 };
-#define ICON_BATTERY_CHARGING "\xee\xa2\x83"   // E883? fallback
+// BatteryCharging0..8 = E85A..E862, BatteryCharging10 = E83E (E863 is a battery-saver leaf, skip it).
+inline const char* const ICON_BATTERY_CHARGING_TABLE[11] = {
+    "\xee\xa1\x9a", "\xee\xa1\x9b", "\xee\xa1\x9c", "\xee\xa1\x9d", "\xee\xa1\x9e", "\xee\xa1\x9f",
+    "\xee\xa1\xa0", "\xee\xa1\xa1", "\xee\xa1\xa2", "\xee\xa1\xa2", "\xee\xa0\xbe",
+};
+#define ICON_BATTERY_CHARGING(n) ICON_BATTERY_CHARGING_TABLE[(n)]
