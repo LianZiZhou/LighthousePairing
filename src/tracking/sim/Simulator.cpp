@@ -38,6 +38,10 @@ struct Geometry {
     std::vector<Vec3> points, normals;
 };
 
+// Wire sensor id of model sensor s. Deliberately not the identity (like Knuckles: permuted, id 0 unused)
+// so the channelMap direction is exercised end to end.
+int ReportedId(const SimDevice& d, int s) { return d.sensorCount - s; }
+
 Geometry MakeGeometry(const SimDevice& d) {
     Geometry g;
     int side = d.sensorCount * 3 / 5, top = d.sensorCount - side;
@@ -118,7 +122,7 @@ std::string DeviceConfigJson(const SimDevice& d) {
     for (size_t i = 0; i < g.points.size(); ++i) {
         pts += (i ? ", " : "") + v(g.points[i]);
         nrm += (i ? ", " : "") + v(g.normals[i]);
-        map += (i ? ", " : "") + std::to_string(i);
+        map += (i ? ", " : "") + std::to_string(ReportedId(d, (int)i));
     }
     return "{\n  \"device_class\": \"generic_tracker\",\n  \"device_serial_number\": \"" + d.serial + "\",\n  \"manufacturer\": \"LighthousePairing\",\n" +
            "  \"model_number\": \"" + d.modelNumber + "\",\n  \"render_model\": \"{sim}tracker\",\n" +
@@ -333,7 +337,7 @@ private:
                 if (raw < 0 || raw >= 2 * math::kPi) continue;
                 double ts = tSync + raw / (2 * math::kPi) * rt.period;
                 uint32_t s24 = Dev32(ts) & 0xFFFFFF;
-                entries.push_back({ts, ((uint32_t)s << 27) | (s24 << 3) | 0x2});
+                entries.push_back({ts, ((uint32_t)ReportedId(dev_, (int)s) << 27) | (s24 << 3) | 0x2});
             }
         }
         std::sort(entries.begin() + 1, entries.end(), [](const Entry& a, const Entry& b) { return a.t < b.t; });

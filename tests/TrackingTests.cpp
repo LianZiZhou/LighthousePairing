@@ -91,9 +91,29 @@ TEST_CASE("device model from config JSON") {
     REQUIRE(m.has_value());
     CHECK(m->serial == "LHR-0000ABCD");
     CHECK(m->points.size() == 20);
-    CHECK(m->MapSensor(3) == 3);
+    // sim wire ids are sensorCount - index (id 0 unused)
+    CHECK(m->MapSensor(20) == 0);
+    CHECK(m->MapSensor(17) == 3);
+    CHECK(m->MapSensor(0) == -1);
+    CHECK(m->ReportedId(3) == 17);
     CHECK(m->MapSensor(40) == -1);
     CHECK_FALSE(model::ParseDeviceModel("{\"device_serial_number\":\"x\"}").has_value());
+}
+
+TEST_CASE("channelMap is model index -> wire id (Knuckles layout)") {
+    // excerpt of a real Knuckles map: model 0 is wire 20, model 2 is wire 24; wire 0 and 11 unused
+    std::string json = R"({"device_serial_number":"LHR-TEST","lighthouse_config":{
+        "channelMap":[20,13,24],
+        "modelPoints":[[0,0,0],[1,0,0],[0,1,0]],
+        "modelNormals":[[0,0,1],[0,0,1],[0,0,1]]}})";
+    auto m = model::ParseDeviceModel(json);
+    REQUIRE(m.has_value());
+    CHECK(m->MapSensor(20) == 0);
+    CHECK(m->MapSensor(13) == 1);
+    CHECK(m->MapSensor(24) == 2);
+    CHECK(m->MapSensor(0) == -1);
+    CHECK(m->MapSensor(2) == -1);
+    CHECK(m->ReportedId(2) == 24);
 }
 
 namespace {

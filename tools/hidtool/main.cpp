@@ -260,7 +260,7 @@ static int Angles(const std::string& path, int sensor, int maxLines) {
 }
 
 // Offline solve of a recording with a device config (JSON).
-static int Solve(const std::string& path, const std::string& configPath, int every) {
+static int Solve(const std::string& path, const std::string& configPath, int every, int source, int channel) {
     io::Recording rec;
     std::string err;
     if (!io::LoadRecording(path, rec, &err)) return 1;
@@ -288,6 +288,7 @@ static int Solve(const std::string& path, const std::string& configPath, int eve
     int syncCount = 0;
     std::optional<math::Pose> last;
     for (auto& r : rec.reports) {
+        if (source >= 0 && r.sourceId != source) continue;
         ev.clear();
         dec.Decode(r.bytes.data(), r.bytes.size(), ev);
         for (auto& e : ev) {
@@ -301,6 +302,7 @@ static int Solve(const std::string& path, const std::string& configPath, int eve
                 std::map<int, int> baseIndex;
                 for (auto& [k, o] : latest) {
                     if (sy->time - o.time > 48'000'000 / 30) continue;   // older than ~33 ms
+                    if (channel >= 0 && o.channel != channel) continue;  // bases are not registered here
                     int s = model->MapSensor(o.sensor);
                     if (s < 0) continue;
                     if (!baseIndex.count(o.channel)) {
@@ -338,9 +340,15 @@ static std::string ReadFile(const std::string& path) {
     return s;
 }
 
+// configPath is either one JSON file (used for every device) or a directory of <SERIAL>.json files.
 struct OneFileProvider : model::ModelProvider {
-    std::string json;
-    std::optional<std::string> ConfigFor(const std::string&) override {
+    std::string json, dir;
+    std::optional<std::string> ConfigFor(const std::string& serial) override {
+        if (!dir.empty()) {
+            auto s = ReadFile(dir + "\\" + serial + ".json");
+            if (s.empty()) return std::nullopt;
+            return s;
+        }
         if (json.empty()) return std::nullopt;
         return json;
     }
@@ -348,7 +356,11 @@ struct OneFileProvider : model::ModelProvider {
 
 static int Live(double seconds, const std::string& configPath, bool active, const std::string& replay) {
     auto prov = std::make_shared<OneFileProvider>();
-    prov->json = ReadFile(configPath);
+    DWORD attr = GetFileAttributesA(configPath.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+        prov->dir = configPath;
+    else
+        prov->json = ReadFile(configPath);
     service::TrackingService svc(prov);
     svc.SetOptions({active});
     if (!replay.empty()) {
@@ -417,7 +429,7 @@ int main(int argc, char** argv) {
     if (cmd == "dump" && argc >= 3) return Dump(argv[2], argc >= 4 ? std::atoi(argv[3]) : 4);
     if (cmd == "live" && argc >= 4) return Live(std::atof(argv[2]), argv[3], argc >= 5 && std::string(argv[4]) == "active", "");
     if (cmd == "replay" && argc >= 5) return Live(std::atof(argv[2]), argv[3], false, argv[4]);
-    if (cmd == "solve" && argc >= 4) return Solve(argv[2], argv[3], argc >= 5 ? std::atoi(argv[4]) : 50);
+    if (cmd == "solve" && argc >= 4) return Solve(argv[2], argv[3], argc >= 5 ? std::atoi(argv[4]) : 50, argc >= 6 ? std::atoi(argv[5]) : -1, argc >= 7 ? std::atoi(argv[6]) : -1);
     if (cmd == "angles" && argc >= 4) return Angles(argv[2], std::atoi(argv[3]), argc >= 5 ? std::atoi(argv[4]) : 200);
     if (cmd == "setmode" && argc >= 4) return SetMode(argv[2], argv[3]);
     if (cmd == "decode" && argc >= 3) return Decode(argv[2], argc >= 4 ? std::atoi(argv[3]) : 20);

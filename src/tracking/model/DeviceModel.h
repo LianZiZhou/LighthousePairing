@@ -21,16 +21,23 @@ struct DeviceModel {
     std::string deviceClass;
     std::vector<math::Vec3> points;    // sensor positions, device frame (metres)
     std::vector<math::Vec3> normals;
-    std::vector<int> channelMap;       // reported sensor id -> model index (-1 = unused)
+    // JSON "channelMap": channelMap[modelIndex] = sensor id reported on the wire (same meaning as
+    // libsurvive / SteamVR). Identity on trackers, a permutation with gaps on Knuckles.
+    std::vector<int> channelMap;
+    std::vector<int> modelFromReported;   // inverse of channelMap (-1 = unused id); built by ParseDeviceModel
     math::Pose head;                   // device frame -> "head"/tracking origin (plus_x / plus_z / position)
     ImuCalibration imu;
     bool HasGeometry() const { return !points.empty() && points.size() == normals.size(); }
     /// Model index for a reported sensor id, or -1.
     int MapSensor(int reported) const {
-        if (channelMap.empty()) return reported < (int)points.size() ? reported : -1;
-        if (reported < 0 || reported >= (int)channelMap.size()) return -1;
-        int m = channelMap[reported];
-        return m >= 0 && m < (int)points.size() ? m : -1;
+        if (channelMap.empty()) return reported >= 0 && reported < (int)points.size() ? reported : -1;
+        if (reported < 0 || reported >= (int)modelFromReported.size()) return -1;
+        return modelFromReported[reported];
+    }
+    /// Sensor id reported on the wire for a model index, or -1.
+    int ReportedId(int modelIndex) const {
+        if (channelMap.empty()) return modelIndex;
+        return modelIndex >= 0 && modelIndex < (int)channelMap.size() ? channelMap[modelIndex] : -1;
     }
 };
 

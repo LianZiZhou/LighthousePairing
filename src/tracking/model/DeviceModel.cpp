@@ -2,6 +2,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+
 namespace lhp::tracking::model {
 
 namespace {
@@ -56,6 +58,13 @@ std::optional<DeviceModel> ParseDeviceModel(std::string_view text, std::string* 
     } catch (const std::exception& e) {
         if (error) *error = e.what();
         return std::nullopt;
+    }
+    if (!m.channelMap.empty()) {
+        int maxId = 0;
+        for (int id : m.channelMap) maxId = std::max(maxId, id);
+        m.modelFromReported.assign(maxId + 1, -1);
+        for (int i = 0; i < (int)m.channelMap.size() && i < (int)m.points.size(); ++i)
+            if (m.channelMap[i] >= 0) m.modelFromReported[m.channelMap[i]] = i;
     }
     if (!m.HasGeometry()) {
         if (error) *error = "config has no lighthouse_config geometry";

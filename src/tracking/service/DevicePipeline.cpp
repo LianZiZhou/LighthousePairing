@@ -431,14 +431,11 @@ DeviceSnapshot DevicePipeline::Snapshot() const {
 
     // per-sensor deep data
     if (model_) {
-        std::vector<int> reported(model_->points.size(), -1);
-        for (int r = 0; r < (int)model_->channelMap.size(); ++r)
-            if (model_->channelMap[r] >= 0 && model_->channelMap[r] < (int)reported.size()) reported[model_->channelMap[r]] = r;
         d.sensors.resize(model_->points.size());
         for (size_t s = 0; s < model_->points.size(); ++s) {
             auto& ss = d.sensors[s];
             ss.index = (int)s;
-            ss.reportedId = model_->channelMap.empty() ? (int)s : reported[s];
+            ss.reportedId = model_->ReportedId((int)s);
             ss.point = model_->points[s];
             ss.normal = model_->normals[s];
         }
