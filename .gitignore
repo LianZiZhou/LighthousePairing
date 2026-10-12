@@ -1,0 +1,18 @@
+# build output
+build/
+dist/
+out/
+
+# IDE / tooling
+.vs/
+.vscode/
+.idea/
+*.user
+CMakeUserPresets.json
+compile_commands.json
+
+# runtime artefacts
+imgui.ini
+*.log
+__pycache__/
+*.pyc

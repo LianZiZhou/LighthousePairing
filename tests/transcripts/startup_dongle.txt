@@ -1,0 +1,26 @@
+Version:  lighthouse_console.exe (buildbot_vortex-windows_steamvr_rel_win64@vortex-windows)  11000037
+Attached lighthouse receiver devices: 11
+	93F15DFEA6
+	3FFB638C3F
+	F8D1DC0915
+	796790ADDC
+	ADD66C2A2F-LYM
+	F3F93916B4
+	62211C157A
+	A9623D96F0
+	0D278B9062
+	09BCE41887-LYM
+	7EA0D62A2B
+lighthouse_console: Connected to receiver 09BCE41887-LYM
+Attempting HID Open IMU: 09BCE41887-LYM
+Lighthouse IMU HID opened
+09BCE41887-LYM: Unable to request config start from device
+09BCE41887-LYM: Triggered keepalive (succeeded)
+
+lh> lh> battery status not provided by device
+lh> imu 0 rate -0.0Hz interval 0.0ms sigma 0.000ms grav 0.00m/s/s sigma 0.000
+lh> USB status (rates over 10 sec)
+  28de 2102 09BCE41887-LYM IMU             0/sec, max interval 0ms
+lh> Error reading Lighthouse Error Report
+lh> Dongles:F3F93916B4,1461100729,;ADD66C2A2F-LYM,1558748372,;796790ADDC,1461100729,;F8D1DC0915,1461100729,;09BCE41887-LYM,1558748372,;0D278B9062,1461100729,;93F15DFEA6,1461100729,;62211C157A,1461100729,;A9623D96F0,1461100729,;3FFB638C3F,1461100729,;7EA0D62A2B,1461100729,
+lh> 

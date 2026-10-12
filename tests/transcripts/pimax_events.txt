@@ -1,0 +1,10 @@
+LHR-F0F4B423: Connected to receiver 18848BA78B
+LHR-F0F4B423 C: Saw demod rate 657/s, enabling Sync on Beam
+LHR-F0F4B423 C: ----- BOOTSTRAPPED base AF39CFE1 (immediate) distance 3.25m velocity 0.03m/s base pitch ~27.1 deg roll ~-2.9 deg -----
+109031C053: Packet received after 0.484s, keepalive (0/1)
+109031C053: Wireless controller LHR-9E63AEE0 disconnected
+LHR-9E63AEE0: Disconnected from receiver 109031C053
+LHR-9E63AEE0 C: Resetting tracking: position out of bounds (0.14, -6.6, -2.5)
+imu 62 rate 245.1Hz interval 4.1ms sigma 0.506ms grav 9.97m/s/s sigma 0.016
+Pairing Success
+Could not unpair dongle 109031C053
