@@ -10,18 +10,27 @@
 //   --open wizard|danger|settings|kill|about
 //   --screenshot FILE.bmp  render, save the back buffer after --frames frames (default 150) and exit
 //   --dump-usb FILE        write the USB topology report and exit
+//   --spatial              focus the 3D tracking window
+//   --replay FILE.lhrec    feed the tracking pipeline from a recording instead of live HID
+//   --tracking-active      start the tracking subsystem in active mode (may switch devices to raw1)
+//   --inspector N          spatial inspector tab (0 pose, 1 sensors, 2 bases, 3 data, 4 plots, 5 log)
 #include <windows.h>
 #include <shellapi.h>
 
 #include "backend/SystemInfo.h"
 #include "backend/UsbTopology.h"
 #include "core/Service.h"
+#include "core/TrackingModels.h"
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #include "implot.h"
+#include "platform/Renderer3D.h"
 #include "platform/Window.h"
+#include "tracking/service/TrackingService.h"
+#include "tracking/sim/Simulator.h"
 #include "ui/App.h"
+#include "ui/SpatialView.h"
 #include "ui/Theme.h"
 #include "util/Text.h"
 
@@ -36,7 +45,9 @@ namespace {
 struct Args {
     bool demo = false, noMica = false, freshLayout = false;
     int w = 1500, h = 940;
-    std::string select, open, screenshot, dumpUsb;
+    std::string select, open, screenshot, dumpUsb, replay;
+    bool spatial = false, trackingActive = false;
+    int inspector = -1;
     int tab = -1, frames = 150, theme = -1;
     bool overview = false;
 };
@@ -59,6 +70,10 @@ Args ParseArgs() {
         else if (s == "--dump-usb") a.dumpUsb = next();
         else if (s == "--theme") a.theme = std::atoi(next().c_str());
         else if (s == "--overview") a.overview = true;
+        else if (s == "--spatial") a.spatial = true;
+        else if (s == "--replay") a.replay = next();
+        else if (s == "--tracking-active") a.trackingActive = true;
+        else if (s == "--inspector") a.inspector = std::atoi(next().c_str());
         else if (s == "--size") {
             std::string v = next();
             sscanf_s(v.c_str(), "%dx%d", &a.w, &a.h);
@@ -117,7 +132,30 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     ui::LoadFonts(1.5f);   // initial guess; refined on the first frames
     applyLook(settings);
 
+    // Spatial tracking: raw HID -> poses (see docs/TRACKING.md). Passive unless the user enables active mode.
+    tracking::service::TrackingService tracker(std::make_shared<StoreModelProvider>(store),
+                                               args.demo ? nullptr : std::make_shared<FileCalibrationCache>(dataDir + "\\base_stations.json"));
+    if (!args.replay.empty()) {
+        std::string err;
+        tracker.StartReplay(args.replay, &err);
+    } else if (args.demo) {
+        // Demo: simulated base stations and devices drive the real decode -> solve pipeline.
+        auto scene = tracking::sim::DemoScene({"D1E1CD00DA-RYB", "F51A4164A2-RYB", "68C52C2C3A-RYB", "109031C053"});
+        std::vector<std::unique_ptr<tracking::io::ReportSource>> sources;
+        for (size_t i = 0; i < scene.devices.size(); ++i) sources.push_back(tracking::sim::OpenSimSource(scene, i, (uint16_t)i, true));
+        tracker.StartSources(std::move(sources), "模拟数据", "演示模式：模拟的基站与设备数据（走完整的解码与解算流程）", tracking::sim::MakeModelProvider(scene), true);
+    } else {
+        tracker.Start();
+    }
+    if (args.trackingActive) tracker.SetOptions({true});
+    gfx::Renderer3D renderer3d;
+    renderer3d.Init(win.device, win.context);
+    ui::SpatialView spatial(tracker, renderer3d, dataDir + "\\recordings");
+    if (args.inspector >= 0) spatial.SetInspectorTab(args.inspector);
+
     ui::App app(store, *service);
+    app.AttachSpatial(&spatial);
+    if (args.spatial) app.FocusSpatial();
     if (!args.select.empty()) app.Select(args.select);
     if (args.tab >= 0 && args.tab < (int)ui::DetailTab::Count) app.SetTab((ui::DetailTab)args.tab);
 
@@ -176,6 +214,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         if (!win.Focused() && !app.WantsFastFrames() && args.screenshot.empty()) win.WaitForEvents(120);
     }
 
+    tracker.Stop();
+    renderer3d.Shutdown();
     service->Shutdown();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

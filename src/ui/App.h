@@ -8,6 +8,8 @@
 
 namespace lhp::ui {
 
+class SpatialView;
+
 enum class DetailTab { Overview, Signal, Device, Usb, History, Console, Count };
 
 struct DangerDialog {
@@ -113,6 +115,9 @@ public:
     void ClearThemeDirty() { themeDirty_ = false; }
 
     void Post(Command c) { pending_.push_back(std::move(c)); }
+    /// The 3D tracking window (optional; owned by the caller).
+    void AttachSpatial(SpatialView* v) { spatial_ = v; }
+    void FocusSpatial() { focusSpatial_ = true; }
 
 private:
     void DrawToolbar(AppState& s);
@@ -148,6 +153,8 @@ private:
     bool fastFrames_ = false;
     bool layoutChecked_ = false;
     bool themeDirty_ = false;
+    SpatialView* spatial_ = nullptr;
+    bool focusSpatial_ = false;
     std::vector<PairingRecord> historyCache_;
     std::string historyCacheFor_;
     double historyCacheT_ = -100;

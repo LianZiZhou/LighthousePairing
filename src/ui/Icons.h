@@ -42,6 +42,10 @@
 #define ICON_LIGHTBULB  "\xee\xaa\x80"   // EA80 Lightbulb
 #define ICON_HELP       "\xee\xa2\x97"   // E897
 #define ICON_EXPORT     "\xee\xb7\xa1"   // EDE1
+#define ICON_RECORD     "\xee\x9f\x88"   // E7C8 Record
+#define ICON_GLOBE      "\xee\x9d\xb4"   // E774 Globe
+#define ICON_LOCATION   "\xee\xa0\x9d"   // E81D Location
+#define ICON_OPENFILE   "\xee\xa3\xa5"   // E8E5 OpenFile
 #define ICON_BATTERY(n) ICON_BATTERY_TABLE[(n)]
 
 // Segoe MDL2 / Fluent: Battery0..9 = E850..E859, Battery10 = E83F (not E85A - that is BatteryCharging0).

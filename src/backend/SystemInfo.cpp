@@ -3,6 +3,7 @@
 #include "util/Text.h"
 
 #include <windows.h>
+#include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <tlhelp32.h>
@@ -122,6 +123,12 @@ std::string ReadCachedDeviceConfig(const std::string& deviceSerial) {
     return ReadTextFile(dir + "\\lighthouse\\" + s + "\\config.json");
 }
 
+std::string DeviceConfigPath(const std::string& deviceSerial) {
+    std::string s = deviceSerial;
+    for (auto& c : s) c = (char)std::toupper((unsigned char)c);
+    return DataDir() + "\\device_configs\\" + s + ".json";
+}
+
 std::string ReadSteamVrSettings() {
     std::string dir = FindSteamConfigDir();
     return dir.empty() ? std::string() : ReadTextFile(dir + "\\steamvr.vrsettings");
@@ -221,6 +228,20 @@ std::string DataDir() {
 
 void OpenInExplorer(const std::string& path) {
     ShellExecuteW(nullptr, L"open", ToWide(path).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+std::string PickOpenFile(const wchar_t* filter, const std::string& initialDir) {
+    wchar_t file[MAX_PATH]{};
+    std::wstring dir = ToWide(initialDir);
+    OPENFILENAMEW ofn{sizeof ofn};
+    ofn.hwndOwner = GetActiveWindow();
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrInitialDir = dir.empty() ? nullptr : dir.c_str();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn)) return {};
+    return ToUtf8(file);
 }
 
 void CopyToClipboard(const std::string& text) {

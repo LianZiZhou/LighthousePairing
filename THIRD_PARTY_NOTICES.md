@@ -10,11 +10,24 @@ The distributed executable statically links the following components, each under
 | [FreeType](https://freetype.org) | 2.14.3 | FreeType License (FTL) | Portions of this software are copyright © 2026 The FreeType Project (https://freetype.org). All rights reserved. |
 | [nlohmann/json](https://github.com/nlohmann/json) | 3.12.0 | MIT | Copyright (c) 2013-2025 Niels Lohmann |
 | [doctest](https://github.com/doctest/doctest) (tests only) | 2.4.12 | MIT | Copyright (c) 2016-2023 Viktor Kirilov |
+| [libsurvive](https://github.com/collabora/libsurvive) (ported code, see below) | master 2024 | MIT | Copyright (c) 2016-2018 <>< Charles Lohr, J. David Berger, Michael W. Turvey; OOTX decoder (C) 2017 Joshua Allen |
 
 Full license texts: `third_party/imgui/LICENSE.txt`, `third_party/implot/LICENSE`,
 `third_party/freetype/docs/FTL.TXT`, and the headers of `third_party/nlohmann/json.hpp` / `third_party/doctest/doctest.h`.
 
-## MIT License (Dear ImGui, ImPlot, nlohmann/json, doctest)
+### libsurvive
+
+The Lighthouse wire-format decoding and LH2 math in `src/tracking/` are ported (rewritten in C++) from libsurvive:
+
+- `protocol/WatchmanDecoder.cpp` – watchman report layout, raw0 / raw1 light data (`driver_vive.c`)
+- `protocol/Commands.h` – light mode switch command (`driver_vive.c`, `vive_switch_mode`)
+- `lighthouse/Ootx.cpp` – OOTX bit stream decoder (`ootx_decoder.c`)
+- `lighthouse/BaseStation.cpp` – OOTX v15 calibration layout, gen2 reprojection model (`ootx_decoder.c`, `survive_reproject_gen2.c`)
+- `lighthouse/Lh2Processor.cpp` – rotor frequencies, sync / sweep to angle (`survive_process_gen2.c`)
+
+libsurvive is distributed under the MIT License reproduced below.
+
+## MIT License (Dear ImGui, ImPlot, nlohmann/json, doctest, libsurvive)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

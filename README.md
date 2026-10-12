@@ -6,6 +6,7 @@
 - **设备身份**：设备上线后用 `downloadconfig` 读取设备自身的 JSON 配置（与 SteamVR 读取的相同），得到准确的序列号、产品名（如 `VIVE Tracker 3.0 MV`、`Knuckles Left`）、制造商、渲染模型和左右手；读取失败时用 SteamVR 缓存 `config\lighthouse\<序列号>\config.json`，追踪器角色取自 `steamvr.vrsettings`。
 - **查看配对关系与设备详情**：每个接收器当前连接 / 历史配对的设备（LHR-xxxxxxxx）、型号、固件、硬件版本、电量，以及 `deviceinfo` / `version` 的全部原始字段。
 - **实时信号**：IMU 采样率、包间隔与抖动 σ、USB 包率与最大间隔、无线丢包（keepalive "Packet received after Xs"）、断开、追踪重置；1/5/15 分钟曲线 + 事件表 + 信号质量评分；“信号总览”表格同时看所有接收器。
+- **空间解算与实时渲染**（「空间」窗口）：不经过 SteamVR，直接读取接收器的原始 HID 数据，自行解码 LH2 光数据与 IMU、接收基站 OOTX 校准、解算设备与基站位姿，并用 3D 视图实时渲染。可查看每个传感器在每个基站下的扫描角度 / 重投影残差 / 命中、基站校准参数与频率、解算残差 / 协方差 / 迭代、IMU 与光学姿态的重力一致性等。支持录制 `.lhrec` 与回放。详见 [docs/TRACKING.md](docs/TRACKING.md)。
 - **USB 拓扑**：从 PCI 控制器 → Hub → 接收器的完整链路、端口号、位置路径、驱动、HID 接口、同 Hub 设备，并据此自动判断“头显内置 / 外置”（可手动修正）。
 - **精确配对控制**：配对向导（选接收器 → 设备类型与检查 → `serial <接收器>` + `pair` → 等待设备 → 校验），震动识别、关机、解除单个接收器的配对、恢复出厂（专家模式）。
 - **安全措施**：写操作前自动备份状态；会话必须确认已连接到目标接收器才会发命令；解配 / 重置需要输入序列号确认；控制台标签页禁止直接输入配对 / 解配 / 重置 / 刷写类命令；检测并可结束 SteamVR / Pimax 等占用接收器的进程。
@@ -51,8 +52,12 @@ build\Release\LighthousePairing.exe --demo     # 演示模式（模拟数据，�
 | `--open wizard\|settings\|danger\|kill\|about` | 启动后打开对应对话框 |
 | `--screenshot out.bmp --frames N` | 渲染 N 帧后保存后台缓冲区并退出 |
 | `--dump-usb out.txt` | 输出 USB 拓扑报告后退出 |
+| `--spatial` | 启动后切到「空间」窗口 |
+| `--replay file.lhrec` | 空间追踪使用录制文件回放（不读取实时 HID） |
+| `--tracking-active` | 空间追踪以主动模式启动（SteamVR 未运行时可把设备切到 raw1） |
+| `--inspector N` | 空间检查器标签页（0 位姿 1 传感器 2 基站 3 数据流 4 曲线 5 日志） |
 
-数据目录：`%LOCALAPPDATA%\LighthousePairing`（`history.json` 历史与设置、`backups\` 写操作前的备份、`imgui.ini` 布局）。
+数据目录：`%LOCALAPPDATA%\LighthousePairing`（`history.json` 历史与设置、`backups\` 写操作前的备份、`imgui.ini` 布局、`device_configs\` 读取到的设备配置、`base_stations.json` 基站校准缓存、`recordings\` 原始 HID 录制）。
 
 ## 结构
 
@@ -65,10 +70,14 @@ src/
   core/     Model / Store (单一状态源) / HistoryDb (JSON 持久化与备份)
             RealService (刷新、每个接收器一个监控会话、配对/解配/重置操作状态机)
             DemoService (模拟数据)
-  platform/ Window (Win32 + D3D11 + DirectComposition/Mica + 截图)
-  ui/       App / Views / Dialogs / Widgets / Theme / Icons
+  tracking/ 空间追踪子系统（不依赖 core / UI，分层见 docs/TRACKING.md）
+            hid (HID 传输) · io (数据源 / 录制回放) · protocol (报告解码、命令) · lighthouse (LH2 角度、OOTX、基站模型)
+            model (设备几何) · solver (LM 位姿解算、场景 / 基站自举) · service (管线、模式策略、快照) · sim (模拟器)
+  platform/ Window (Win32 + D3D11 + DirectComposition/Mica + 截图) / Renderer3D (离屏 3D)
+  ui/       App / Views / Dialogs / Widgets / Theme / Icons / SpatialView
 tests/      doctest 单元测试 + 真机录制的 console 输出
 tools/      b.ps1（开发构建）、shot.ps1（截图并缩小）、probe_console.py（只读探测）、make_icon.py
+            hidtool/ lhp_hidtool：list / capture / dump / decode / angles / solve / live / replay / setmode
 ```
 
 ## 已知限制
@@ -76,6 +85,7 @@ tools/      b.ps1（开发构建）、shot.ps1（截图并缩小）、probe_cons
 - `lighthouse_console` 的 `pair` / `unpair` / `donglereset` 等是未写进 help 的命令，输出格式来自 exe 内字符串与 Pimax 运行时日志，尚未在真机上执行过写操作；首次使用请先在空闲接收器上验证。
 - 离线设备的配对关系 `dongleinfo` 不一定能给出（实测第三个字段为空），因此用“设备读取 / 本次观察 / 历史记录”三级来源区分可信度。
 - 设备在线时的 `deviceinfo` / `version` / `battery` 输出格式按通用 key:value 解析，原始输出在“设备信息”页完整保留。
+- 空间追踪目前只支持接收器（28DE:2101 / 2102）后面的无线设备与 Lighthouse 2.0 基站；USB 直连的头显追踪模块（报告格式不同）与 1.0 基站尚未支持。IMU 只用作角速度先验和重力一致性检查，还没有做完整的 IMU / 光学融合滤波。
 
 ## 许可证
 

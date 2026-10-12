@@ -15,6 +15,9 @@ std::string FindSteamConfigDir();
 /// SteamVR's cached copy of a device's JSON config (<config>\lighthouse\<serial>\config.json); empty if none.
 std::string ReadCachedDeviceConfig(const std::string& deviceSerial);
 
+/// Where this program keeps device configs it downloaded: <DataDir>\device_configs\<SERIAL>.json
+std::string DeviceConfigPath(const std::string& deviceSerial);
+
 /// Contents of <config>\steamvr.vrsettings (tracker role assignments etc.).
 std::string ReadSteamVrSettings();
 
@@ -41,6 +44,9 @@ std::string ReadTextFile(const std::string& path);
 
 /// Open a folder / file in Explorer.
 void OpenInExplorer(const std::string& path);
+
+/// Standard "open file" dialog. `filter` e.g. L"录制文件 (*.lhrec)\0*.lhrec\0". Empty on cancel.
+std::string PickOpenFile(const wchar_t* filter, const std::string& initialDir);
 
 /// Copy text to clipboard.
 void CopyToClipboard(const std::string& text);

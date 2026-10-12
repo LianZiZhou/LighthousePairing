@@ -48,6 +48,32 @@ target_include_directories(imgui PUBLIC ${TP}/imgui ${TP}/imgui/backends ${TP}/i
 target_compile_definitions(imgui PUBLIC IMGUI_ENABLE_FREETYPE IMGUI_DISABLE_OBSOLETE_FUNCTIONS NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
 target_link_libraries(imgui PUBLIC freetype d3d11 dxgi d3dcompiler)
 
+# ---------------------------------------------------------------- tracking (raw HID -> poses), see docs/TRACKING.md
+# Independent of core/UI: depends only on Win32 + the C++ standard library.
+add_library(lhp_tracking STATIC
+    src/tracking/hid/HidDevice.cpp
+    src/tracking/io/ReportSource.cpp
+    src/tracking/io/Recording.cpp
+    src/tracking/protocol/WatchmanDecoder.cpp
+    src/tracking/lighthouse/BaseStation.cpp
+    src/tracking/lighthouse/Ootx.cpp
+    src/tracking/lighthouse/Lh2Processor.cpp
+    src/tracking/model/DeviceModel.cpp
+    src/tracking/solver/PoseSolver.cpp
+    src/tracking/solver/Scene.cpp
+    src/tracking/sim/Simulator.cpp
+    src/tracking/service/HostGuard.cpp
+    src/tracking/service/DevicePipeline.cpp
+    src/tracking/service/TrackingService.cpp
+)
+target_include_directories(lhp_tracking PUBLIC src PRIVATE ${TP})
+target_compile_definitions(lhp_tracking PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(lhp_tracking PUBLIC hid setupapi)
+
+add_executable(lhp_hidtool tools/hidtool/main.cpp)
+target_compile_definitions(lhp_hidtool PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(lhp_hidtool PRIVATE lhp_tracking)
+
 # ---------------------------------------------------------------- core library (no UI) – also used by tests
 add_library(lhp_core STATIC
     src/util/Text.cpp
@@ -60,10 +86,11 @@ add_library(lhp_core STATIC
     src/core/RealService.cpp
     src/core/DemoService.cpp
     src/core/Store.cpp
+    src/core/TrackingModels.cpp
 )
 target_include_directories(lhp_core PUBLIC src ${TP})
 target_compile_definitions(lhp_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
-target_link_libraries(lhp_core PUBLIC setupapi cfgmgr32 shell32 ole32 dwmapi)
+target_link_libraries(lhp_core PUBLIC lhp_tracking setupapi cfgmgr32 shell32 ole32 dwmapi comdlg32)
 
 # ---------------------------------------------------------------- application
 option(LHP_CORE_ONLY "Build only the core library and tests" OFF)
@@ -76,6 +103,8 @@ add_executable(LighthousePairing WIN32
     src/ui/Widgets.cpp
     src/ui/Views.cpp
     src/ui/Dialogs.cpp
+    src/ui/SpatialView.cpp
+    src/platform/Renderer3D.cpp
     src/app.rc
 )
 target_link_libraries(LighthousePairing PRIVATE lhp_core imgui dcomp)
@@ -83,12 +112,13 @@ target_compile_options(LighthousePairing PRIVATE /W4 /permissive- /utf-8 /EHsc /
 endif()
 
 # ---------------------------------------------------------------- tests
-add_executable(lhp_tests tests/ParserTests.cpp tests/StoreTests.cpp tests/main.cpp)
+add_executable(lhp_tests tests/ParserTests.cpp tests/StoreTests.cpp tests/TrackingTests.cpp tests/main.cpp)
 target_include_directories(lhp_tests PRIVATE ${TP}/doctest)
 target_compile_definitions(lhp_tests PRIVATE LHP_TRANSCRIPTS="${CMAKE_SOURCE_DIR}/tests/transcripts")
+target_compile_definitions(lhp_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(lhp_tests PRIVATE lhp_core)
 
-foreach(t lhp_core lhp_tests)
+foreach(t lhp_core lhp_tests lhp_tracking lhp_hidtool)
     target_compile_options(${t} PRIVATE /W4 /permissive- /utf-8 /EHsc /Zc:__cplusplus /wd4100 /wd4505)
 endforeach()
 target_compile_options(imgui PRIVATE /utf-8 /W0)

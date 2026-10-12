@@ -41,7 +41,7 @@ if ($Dist) {
     Copy-Item (Join-Path $build 'LighthousePairing.exe') $out
     $exe = Join-Path $out 'LighthousePairing.exe'
     $deps = (dumpbin /nologo /dependents $exe) -match '^\s+\S+\.dll\s*$' | ForEach-Object { $_.Trim() }
-    $system = 'KERNEL32|USER32|GDI32|SHELL32|OLE32|ADVAPI32|SETUPAPI|CFGMGR32|DWMAPI|D3D11|DXGI|D3DCOMPILER_47|DCOMP|IMM32|COMDLG32|WINMM|SHLWAPI|OLEAUT32'
+    $system = 'KERNEL32|USER32|GDI32|SHELL32|OLE32|ADVAPI32|SETUPAPI|CFGMGR32|DWMAPI|D3D11|DXGI|D3DCOMPILER_47|DCOMP|IMM32|COMDLG32|WINMM|SHLWAPI|OLEAUT32|HID'
     # api-ms-win-* are Windows API-set contracts (resolved by the OS loader), i.e. system too.
     $foreign = $deps | Where-Object { $_ -notmatch "^($system)\.dll$" -and $_ -notmatch '^api-ms-win-' }
     Write-Host "Dependencies: $($deps -join ', ')"

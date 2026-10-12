@@ -4,6 +4,7 @@
 #include "imgui_internal.h"
 #include "implot.h"
 #include "ui/Icons.h"
+#include "ui/SpatialView.h"
 #include "ui/Widgets.h"
 #include "util/Text.h"
 
@@ -108,6 +109,17 @@ void App::Frame() {
         if (ui_.showImGuiDemo) ImGui::ShowDemoWindow(&ui_.showImGuiDemo);
         if (ui_.showImPlotDemo) ImPlot::ShowDemoWindow(&ui_.showImPlotDemo);
     }
+    // The spatial view reads tracking snapshots only (no store lock needed).
+    if (spatial_) {
+        if (ImGuiWindow* detail = ImGui::FindWindowByName("详情###detail"); detail && detail->DockId)
+            ImGui::SetNextWindowDockID(detail->DockId, ImGuiCond_FirstUseEver);
+        if (focusSpatial_) {
+            ImGui::SetNextWindowFocus();
+            focusSpatial_ = false;
+        }
+        spatial_->Draw();
+        fastFrames_ |= spatial_->WantsFastFrames();
+    }
     // Commands are posted after releasing the lock (the demo service locks the store in Post).
     auto cmds = std::move(pending_);
     pending_.clear();
@@ -125,6 +137,7 @@ void App::BuildDefaultLayout(unsigned dockId) {
     ImGui::DockBuilderDockWindow("接收器###receivers", left);
     ImGui::DockBuilderDockWindow("详情###detail", center);
     ImGui::DockBuilderDockWindow("信号总览###overview", center);
+    ImGui::DockBuilderDockWindow(SpatialView::kWindowName, center);
     ImGui::DockBuilderDockWindow("控制台日志###log", bottom);
     ImGui::DockBuilderFinish(dockId);
 }
@@ -196,7 +209,7 @@ void App::DrawToolbar(AppState& s) {
         // Right side buttons
         float bw = ImGui::GetFrameHeight();
         float right = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
-        float total = bw * 4 + ImGui::GetStyle().ItemSpacing.x * 4 + ImGui::CalcTextSize("  配对新设备").x + ImGui::GetStyle().FramePadding.x * 2 + bw;
+        float total = bw * 5 + ImGui::GetStyle().ItemSpacing.x * 5 + ImGui::CalcTextSize("  配对新设备").x + ImGui::GetStyle().FramePadding.x * 2 + bw;
         ImGui::SameLine(right - total);
         ImGui::SetCursorPosY(ImGui::GetStyle().WindowPadding.y);
         if (AccentButton(ICON_ADD "  配对新设备")) OpenWizard(ui_.selected);
@@ -211,6 +224,8 @@ void App::DrawToolbar(AppState& s) {
         if (IconButton(anyMon && s.settings.autoMonitorAll ? ICON_PAUSE : ICON_PLAY, anyMon && s.settings.autoMonitorAll ? "停止所有实时监控" : "开始监控所有接收器",
                        ImVec2(bw, bw)))
             Post({anyMon && s.settings.autoMonitorAll ? Command::Type::StopAllMonitors : Command::Type::MonitorAll});
+        ImGui::SameLine();
+        if (spatial_ && IconButton(ICON_GLOBE, "空间解算与实时渲染", ImVec2(bw, bw))) focusSpatial_ = true;
         ImGui::SameLine();
         if (IconButton(ICON_SETTINGS, "设置", ImVec2(bw, bw))) ui_.showSettings = true;
         ImGui::SameLine();

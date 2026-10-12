@@ -388,8 +388,11 @@ void Monitor::PollOnce(ConsoleSession& s, bool& online, double& lastBattery, dou
         std::string path = sys::ConsoleTempFile("lhp_config_" + serial_ + ".json");
         sys::DeleteFileUtf8(path);
         if (s.Execute("downloadconfig \"" + path + "\"", nullptr, 12.0, nullptr)) {
-            auto c = devcfg::Parse(sys::ReadTextFile(path));
+            std::string text = sys::ReadTextFile(path);
+            auto c = devcfg::Parse(text);
             if (c.ok) {
+                // Keep the full config: the spatial view needs its sensor geometry.
+                if (!c.serial.empty()) sys::WriteTextFile(sys::DeviceConfigPath(c.serial), text);
                 cfg = std::move(c);
                 cfgSource = ConfigSource::Device;
                 configTries_ = 0;
