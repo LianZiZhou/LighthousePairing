@@ -106,8 +106,6 @@ void App::Frame() {
         DrawIdentifyDialog(s);
         DrawOpOverlay(s);
         DrawToasts(s);
-        if (ui_.showImGuiDemo) ImGui::ShowDemoWindow(&ui_.showImGuiDemo);
-        if (ui_.showImPlotDemo) ImPlot::ShowDemoWindow(&ui_.showImPlotDemo);
     }
     // The spatial view reads tracking snapshots only (no store lock needed).
     if (spatial_) {

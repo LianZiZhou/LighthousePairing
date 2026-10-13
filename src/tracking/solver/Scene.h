@@ -16,6 +16,7 @@
 // Not thread-safe; the owner (TrackingService) serialises access.
 #include "tracking/lighthouse/BaseStation.h"
 #include "tracking/math/Linalg.h"
+#include "tracking/solver/BaseRefiner.h"
 
 #include <array>
 #include <cstdint>
@@ -46,7 +47,7 @@ struct UniverseRecord {
     bool fixed = false;          // do not refine (SteamVR's solution is taken as is)
 };
 
-enum class PoseSource : uint8_t { None, Reference, Bootstrap, SavedUniverse, SteamVrUniverse };
+enum class PoseSource : uint8_t { None, Reference, Bootstrap, SavedUniverse, SteamVrUniverse, Refined };
 const char* ToString(PoseSource s);
 
 struct BaseState {
@@ -63,6 +64,19 @@ struct BaseState {
     int samples = 0;               // bootstrap samples averaged
     int rejectedSamples = 0;       // bootstrap samples rejected as outliers
     double lastSpreadMm = 0;       // disagreement of the latest bootstrap sample vs the average
+    // multi-position refinement (BaseRefiner)
+    int refineKeyframes = 0;
+    int refinements = 0;           // results applied
+    RefineResult lastRefine;
+};
+
+/// A refinement solve to run outside the world lock (Scene::TakeRefineJob -> Solve -> ApplyRefineResult).
+struct RefineJob {
+    int channel = -1;
+    uint64_t generation = 0;
+    BaseRefiner refiner;
+    lighthouse::AxisCal cal[2];
+    math::Pose seed;               // current refFromBase
 };
 
 class Scene {
@@ -74,6 +88,13 @@ public:
     void AddBootstrapSample(int channel, const math::Pose& refFromDevice, const math::Pose& baseFromDevice);
     /// True when this base may (still) learn its pose from devices.
     bool ReadyToBootstrap(int channel) const;
+    /// Multi-position refinement: does a device at refFromDevice add a useful viewpoint of this base?
+    bool WantsRefineKeyframe(int channel, const math::Pose& refFromDevice) const;
+    void AddRefineKeyframe(int channel, RefineKeyframe k);
+    /// A copy of the keyframes when enough new ones arrived since the last solve.
+    std::optional<RefineJob> TakeRefineJob(int channel);
+    /// Applies a solved job unless the base was reset meanwhile; returns true if the pose changed.
+    bool ApplyRefineResult(const RefineJob& job, const RefineResult& r);
     /// Gravity direction measured by a still, tracked device, expressed in the reference base frame.
     void AddUpSample(const math::Vec3& upInRef);
     void SetUseDeviceTilt(bool on);
@@ -112,8 +133,11 @@ public:
 private:
     void TryApplyUniverses();
     void UpdateUp();
+    void ClearRefiner(int ch);
 
     std::array<BaseState, lighthouse::kMaxChannels> bases_{};
+    std::array<BaseRefiner, lighthouse::kMaxChannels> refiners_{};
+    std::array<uint64_t, lighthouse::kMaxChannels> refineGen_{};   // bumped whenever a base's pose restarts
     int ref_ = -1;
     double refHeight_ = 2.0;
     uint64_t version_ = 1;

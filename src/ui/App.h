@@ -40,8 +40,6 @@ struct UiState {
     int filter = 0;            // 0 all, 1 online, 2 idle, 3 attention
     bool showSettings = false;
     bool showAbout = false;
-    bool showImGuiDemo = false;
-    bool showImPlotDemo = false;
     bool showKill = false;
     DangerDialog danger;
     PairWizard wizard;

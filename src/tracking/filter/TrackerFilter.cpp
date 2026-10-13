@@ -108,9 +108,32 @@ void TrackerFilter::Reset() {
     P_.fill(0);
 }
 
-void TrackerFilter::Initialize(double t, const Pose& worldFromDevice, const std::array<double, 36>& poseCov, const Vec3& angVelWorld, const Vec3& gyroBias) {
+void TrackerFilter::Reanchor(double t, const Pose& worldFromDevice, const std::array<double, 36>& poseCov) {
+    if (!init_) return;
+    Predict(t);
+    const Vec3 v = v_, w = w_, bg = bg_, ba = ba_;
+    const Covariance old = P_;
+    // the solve may be older than the filter (light trails the IMU): carry it forward with the current motion
+    Pose p = worldFromDevice;
+    double tt = t;
+    if (t < t_) {
+        double dt = t_ - t;
+        p = {(Quat::FromRotVec(w * dt) * p.rot).Normalized(), p.pos + v * dt + a_ * (0.5 * dt * dt)};
+        tt = t_;
+    }
+    Initialize(tt, p, poseCov, w, bg, v);
+    ba_ = ba;
+    // keep what the IMU had learned about the biases
+    for (int i : {kBg, kBa})
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) P_[(i + r) * N + i + c] = old[(i + r) * N + i + c];
+}
+
+void TrackerFilter::Initialize(double t, const Pose& worldFromDevice, const std::array<double, 36>& poseCov, const Vec3& angVelWorld, const Vec3& gyroBias,
+                               const Vec3& velocity) {
     pose_ = worldFromDevice;
     v_ = a_ = ba_ = Vec3{};
+    v_ = velocity;
     w_ = angVelWorld;
     bg_ = gyroBias;
     P_.fill(0);
@@ -522,14 +545,16 @@ LightUpdate TrackerFilter::UpdateLight(const std::vector<LightMeas>& meas, const
     }
     out.rmsBeforeRad = out.used ? std::sqrt(sumR2 / out.used) : 0;
     out.nis = out.used ? sumNis / out.used : 0;
-    // A converged filter takes even single angles (like Crazyflie's per-sweep update); right after
-    // initialisation a few are needed together so one bad angle cannot drag the state.
-    if (out.used < (converging ? 4 : 1)) {
-        out.note = "可用观测不足";
+    // Whole-batch consistency first: if a real fraction of one rotation disagrees, the state is what is wrong.
+    // Fitting only the agreeing subset is how a filter talks itself into a wrong pose.
+    const int judged = out.used + out.gated;
+    if (judged >= prm_.minUsed && out.gated > std::max(1.0, prm_.maxGatedFraction * judged)) {
+        out.inconsistent = true;
+        out.note = "整批观测与滤波器不一致";
         return out;
     }
-    if (out.n >= 6 && out.gated > out.used) {
-        out.note = "多数观测被新息门限拒绝";
+    if (out.used < prm_.minUsed) {
+        out.note = "可用观测不足";
         return out;
     }
 

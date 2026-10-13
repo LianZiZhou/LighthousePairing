@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <ctime>
 
 namespace lhp::tracking::service {
@@ -78,6 +79,12 @@ void TrackingService::StartSources(std::vector<std::unique_ptr<io::ReportSource>
         world_.scene.Reset();
         world_.scene.SetReferenceHeight(h);
         knownUniverses_ = 0;
+        // a recording of these same base stations restores like live data (ids decide; others are ignored)
+        if (world_.cache && !simulated) {
+            auto u = world_.cache->LoadUniverses();
+            knownUniverses_ = (int)u.size();
+            world_.scene.SetKnownUniverses(std::move(u));
+        }
     }
     {
         std::scoped_lock lk(mtx_);
@@ -86,7 +93,7 @@ void TrackingService::StartSources(std::vector<std::unique_ptr<io::ReportSource>
         replayPath_ = label;
         for (auto& src : sources) {
             std::string key = src->Info().serial.empty() ? std::to_string(src->Info().id) : src->Info().serial;
-            PipelineConfig cfg{models ? models : models_, &world_, [this](const std::string& m) { Log(m); }, std::nullopt};
+            PipelineConfig cfg{models ? models : models_, &world_, [this](const std::string& m) { Log(m); }, std::nullopt, trace_};
             auto p = std::make_unique<DevicePipeline>(std::move(src), cfg);
             if (recorder_) p->SetRecorder(recorder_);
             p->Start();
@@ -182,6 +189,37 @@ void TrackingService::MaybeSaveUniverse() {
     world_.cache->SaveUniverse(u);
 }
 
+void TrackingService::RefineBases() {
+    std::vector<solver::RefineJob> jobs;
+    {
+        std::scoped_lock wl(world_.mutex);
+        for (int ch = 0; ch < lighthouse::kMaxChannels; ++ch)
+            if (auto j = world_.scene.TakeRefineJob(ch)) jobs.push_back(std::move(*j));
+    }
+    for (auto& j : jobs) {
+        solver::RefineResult r = j.refiner.Solve(j.cal, j.seed);
+        bool applied;
+        uint32_t id = 0;
+        {
+            std::scoped_lock wl(world_.mutex);
+            applied = world_.scene.ApplyRefineResult(j, r);
+            if (const auto& cal = world_.scene.Base(j.channel).cal) id = cal->id;
+        }
+        if (trace_) {
+            char t[256];
+            std::snprintf(t, sizeof t, "world,F,%d,%d,%d,%d,%.5f,%.5f,%.1f,%.3f,%d,%s", j.channel, r.keyframes, r.measurements, (int)applied,
+                          r.rmsBeforeRad * 180 / math::kPi, r.rmsAfterRad * 180 / math::kPi, r.movedMm, r.rotatedDeg, r.used, r.note.c_str());
+            trace_(t);
+        }
+        if (applied && (r.movedMm > 5 || r.rotatedDeg > 0.1)) {
+            char b[256];
+            std::snprintf(b, sizeof b, "基站 %08X（频道 %d）位姿已用 %d 个位置精化：移动 %.0f mm / %.2f°，残差 %.3f° → %.3f°", id, j.channel + 1, r.keyframes,
+                          r.movedMm, r.rotatedDeg, r.rmsBeforeRad * 180 / math::kPi, r.rmsAfterRad * 180 / math::kPi);
+            Log(b);
+        }
+    }
+}
+
 void TrackingService::SetReferenceHeight(double m) {
     std::scoped_lock wl(world_.mutex);
     world_.scene.SetReferenceHeight(m);
@@ -231,7 +269,7 @@ void TrackingService::Discover() {
             Log("无法打开 " + d.serial + ": " + err);
             continue;
         }
-        PipelineConfig cfg{models_, &world_, [this](const std::string& m) { Log(m); }, d};
+        PipelineConfig cfg{models_, &world_, [this](const std::string& m) { Log(m); }, d, trace_};
         auto p = std::make_unique<DevicePipeline>(std::move(src), cfg);
         std::scoped_lock lk(mtx_);
         if (stop_ || replay_ || pipelines_.count(d.serial)) continue;
@@ -263,6 +301,7 @@ void TrackingService::Housekeeping() {
             lastDiscover = now;
             Discover();
         }
+        RefineBases();
         if (!replay && now - lastSave > std::chrono::seconds(10)) {
             lastSave = now;
             MaybeSaveUniverse();

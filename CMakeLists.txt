@@ -59,6 +59,7 @@ add_library(lhp_tracking STATIC
     src/tracking/lighthouse/Ootx.cpp
     src/tracking/lighthouse/Lh2Processor.cpp
     src/tracking/model/DeviceModel.cpp
+    src/tracking/solver/BaseRefiner.cpp
     src/tracking/solver/PoseSolver.cpp
     src/tracking/solver/Scene.cpp
     src/tracking/solver/UniverseIo.cpp
@@ -110,6 +111,16 @@ add_executable(LighthousePairing WIN32
     src/app.rc
 )
 target_link_libraries(LighthousePairing PRIVATE lhp_core imgui dcomp)
+# Build identifier (CI release builds: the short commit hash, which is also the release's version).
+set(LHP_BUILD_ID "" CACHE STRING "Build identifier shown in the About dialog and the exe's ProductVersion")
+if(LHP_BUILD_ID)
+    set(LHP_PRODUCT_VERSION "${PROJECT_VERSION}+${LHP_BUILD_ID}")
+else()
+    set(LHP_PRODUCT_VERSION "${PROJECT_VERSION}")
+endif()
+# also seen by the resource compiler (app.rc)
+target_compile_definitions(LighthousePairing PRIVATE LHP_VERSION="${PROJECT_VERSION}" LHP_BUILD_ID="${LHP_BUILD_ID}"
+                                                     LHP_PRODUCT_VERSION="${LHP_PRODUCT_VERSION}")
 target_compile_options(LighthousePairing PRIVATE /W4 /permissive- /utf-8 /EHsc /Zc:__cplusplus /wd4100 /wd4505)
 endif()
 

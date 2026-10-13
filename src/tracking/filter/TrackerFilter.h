@@ -50,6 +50,11 @@ struct FilterParams {
     double gateSigma = 5.0;        // innovation gate, in innovation standard deviations
     double gateSigmaConverging = 12.0;
     double convergeSeconds = 0.6;  // looser gate right after (re)initialisation
+    // One update = one base rotation. A handful of angles from one plane can be explained by a wrong pose and
+    // would drag the state away (then the gate rejects exactly the angles that would correct it):
+    int minUsed = 5;                 // libsurvive kalman-lightcap-minimum-sensors = 5
+    double maxGatedFraction = 0.25;  // more rejected than this: the batch disagrees with the state as a whole
+                                     // -> nothing is applied (the caller decides whether the filter is lost)
     double zvuStationaryVar = 1e-5;   // libsurvive kalman-zvu-stationary
     double zvuNoLightVar = 1e-4;      // libsurvive kalman-zvu-no-light
     int maxIterations = 4;
@@ -76,6 +81,7 @@ struct LightBase {
 
 struct LightUpdate {
     bool applied = false;
+    bool inconsistent = false;   // the batch as a whole disagrees with the state (filter probably wrong)
     std::string note;            // why not applied
     int n = 0, used = 0, gated = 0, facingAway = 0, iterations = 0;
     double rmsBeforeRad = 0, rmsAfterRad = 0;   // over used measurements
@@ -100,7 +106,9 @@ public:
     void Reset();
     /// Start from a bootstrap pose (batch solve) with its 6x6 covariance [rx ry rz tx ty tz].
     void Initialize(double t, const math::Pose& worldFromDevice, const std::array<double, 36>& poseCov, const math::Vec3& angVelWorld,
-                    const math::Vec3& gyroBias = {});
+                    const math::Vec3& gyroBias = {}, const math::Vec3& velocity = {});
+    /// Recovery: jump to an independently solved pose, keeping the motion and IMU bias estimates.
+    void Reanchor(double t, const math::Pose& worldFromDevice, const std::array<double, 36>& poseCov);
 
     double Time() const { return t_; }
     double SecondsSinceInit() const { return t_ - tInit_; }

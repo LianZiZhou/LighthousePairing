@@ -7,7 +7,7 @@
 //   --size WxH             initial logical window size
 //   --select SERIAL        preselect a receiver
 //   --tab N                0 overview, 1 signal, 2 device, 3 usb, 4 history, 5 console
-//   --open wizard|danger|settings|kill|about
+//   --open wizard|danger|settings|kill|about|record-notice
 //   --screenshot FILE.bmp  render, save the back buffer after --frames frames (default 150) and exit
 //   --dump-usb FILE        write the USB topology report and exit
 //   --spatial              focus the 3D tracking window
@@ -198,6 +198,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             else if (args.open == "kill") app.OpenKill();
             else if (args.open == "about") app.OpenAbout();
             else if (args.open == "identify") app.OpenIdentify(args.select);
+            else if (args.open == "record-notice") spatial.OpenRecordNotice();
         }
         if (args.overview && frame == 3) ImGui::SetWindowFocus("信号总览###overview");
         app.Frame();

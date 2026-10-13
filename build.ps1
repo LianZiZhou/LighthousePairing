@@ -3,12 +3,14 @@
 #   .\build.ps1 -Test           ... and run the unit tests
 #   .\build.ps1 -Clean          wipe build\<Config> first
 #   .\build.ps1 -Dist           clean, from-scratch, optimised build of ONE self-contained exe -> dist\LighthousePairing.exe
+#   .\build.ps1 -Dist -BuildId abc1234   ... stamped with a build id (CI: the short commit hash)
 #                               (static CRT, FreeType/ImGui/ImPlot linked in, icon + version embedded; only Windows system DLLs)
 param(
     [ValidateSet('Release','Debug')] [string]$Config = 'Release',
     [switch]$Clean,
     [switch]$Test,
-    [switch]$Dist
+    [switch]$Dist,
+    [string]$BuildId = ''
 )
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -30,7 +32,7 @@ function Invoke-Configure([string]$dir, [string[]]$extra) {
 if ($Dist) {
     $build = Join-Path $root 'build\dist'
     if (Test-Path $build) { Remove-Item $build -Recurse -Force }
-    Invoke-Configure $build @('-DCMAKE_BUILD_TYPE=Release', '-DLHP_DIST=ON')
+    Invoke-Configure $build @('-DCMAKE_BUILD_TYPE=Release', '-DLHP_DIST=ON', "-DLHP_BUILD_ID=$BuildId")
     cmake --build $build --target LighthousePairing lhp_tests
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     & (Join-Path $build 'lhp_tests.exe') --minimal

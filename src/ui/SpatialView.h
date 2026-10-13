@@ -17,12 +17,16 @@ public:
     bool WantsFastFrames() const { return visible_; }
     /// 0 pose, 1 sensors, 2 bases, 3 data stream, 4 plots, 5 log (test hook)
     void SetInspectorTab(int t) { forceTab_ = t; }
+    void OpenRecordNotice() { openRecordNotice_ = true; }   // test hook (--open record-notice)
     static constexpr const char* kWindowName = "空间###spatial";
 
 private:
     using Snap = tracking::service::TrackingSnapshot;
     using Dev = tracking::service::DeviceSnapshot;
     void DrawToolbar(const Snap& s);
+    void StartRecording();
+    void DrawRecordNotice();   // body-tracking data protection notice, confirmed before recording
+    static constexpr const char* kRecordNoticeId = "录制提示###recordnotice";
     void DrawViewport(const Snap& s, float width, float height);
     void BuildScene(const Snap& s);
     void DrawOverlay(const Snap& s, const ImVec2& origin);
@@ -49,6 +53,9 @@ private:
     bool framed_ = false;
     float baseHeight_ = 2.0f;
     std::string lastError_;
+    bool recordNoticeAck_ = false;    // confirmed with "不再提示" (this run only)
+    bool recordNoticeSkip_ = false;
+    bool openRecordNotice_ = false;
     int sensorBaseFilter_ = -1;
     int forceTab_ = -1;
 };

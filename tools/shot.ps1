@@ -12,7 +12,7 @@ $argList = "$AppArgs --screenshot `"$bmp`" --frames $Frames"
 $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru
 if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'app did not exit' }
 if (-not (Test-Path $bmp)) { throw "no screenshot produced (exit $($p.ExitCode))" }
-$py = 'C:\Users\lianzhou\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe'
+$py = if ($env:LHP_PYTHON) { $env:LHP_PYTHON } else { 'python' }   # needs Pillow
 & $py -c "from PIL import Image; im=Image.open(r'$bmp'); w,h=im.size; s=min(1.0,$MaxWidth/w); im=im.resize((int(w*s),int(h*s)), Image.LANCZOS) if s<1 else im; im.save(r'$png', optimize=True); import os; print(im.size, os.path.getsize(r'$png'))"
 Remove-Item $bmp
 $png

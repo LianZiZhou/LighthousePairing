@@ -602,7 +602,7 @@ void App::DrawSettings(AppState& s) {
             changed = true;
             themeDirty_ = true;
         }
-        changed |= ImGui::Checkbox("Mica 半透明背景（Windows 11，重启后生效）", &st.useMica);
+        changed |= ImGui::Checkbox("半透明背景（Windows 11，重启后生效）", &st.useMica);
 
         ImGui::SeparatorText("安全");
         changed |= ImGui::Checkbox("专家模式", &st.expertMode);
@@ -613,10 +613,6 @@ void App::DrawSettings(AppState& s) {
         if (ImGui::SmallButton(ICON_FOLDER " 打开数据目录")) sys::OpenInExplorer(s.dataDir);
         ImGui::SameLine();
         if (ImGui::SmallButton(ICON_FOLDER " 打开备份目录")) sys::OpenInExplorer(svc_.BackupDir());
-        ImGui::SameLine();
-        if (ImGui::SmallButton("ImGui 演示")) ui_.showImGuiDemo = true;
-        ImGui::SameLine();
-        if (ImGui::SmallButton("ImPlot 演示")) ui_.showImPlotDemo = true;
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -650,18 +646,15 @@ void App::DrawAbout(AppState& s) {
     bool open = true;
     if (ImGui::BeginPopupModal("关于###about", &open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize)) {
         BigText(1.4f, "Lighthouse 配对管理");
-        TextDim("版本 0.4.0 · C++20");
+        TextDim("版本 %s%s%s", LHP_VERSION, LHP_BUILD_ID[0] ? " · 构建 " : "", LHP_BUILD_ID);
         ImGui::Spacing();
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + fs * 27);
         ImGui::TextUnformatted("列出所有 Lighthouse 接收器，查看配对关系、详细设备信息和实时无线信号，并精确地把设备配对到指定接收器。");
         ImGui::Spacing();
-        TextDim("底层通过 SteamVR 自带的 lighthouse_console.exe 与接收器通信；USB 拓扑通过 SetupAPI / CfgMgr32 获取。所有写操作都会先校验目标、自动备份并要求确认。");
+        TextDim("需要安装 SteamVR。所有写操作都会先校验目标、自动备份并要求确认。");
         ImGui::PopTextWrapPos();
         ImGui::Spacing();
         if (BeginPropTable("##ab")) {
-            PropRow("Dear ImGui", IMGUI_VERSION " (docking)");
-            PropRow("ImPlot", IMPLOT_VERSION);
-            PropRow("渲染", "Direct3D 11 + DirectComposition");
             PropRow("Windows 版本", std::to_string(sys::WindowsBuild()));
             PropRow("SteamVR", s.steamVrRuntime);
             EndPropTable();

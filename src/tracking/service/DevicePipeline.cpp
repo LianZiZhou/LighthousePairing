@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdarg>
+#include <cstdio>
 #include <cmath>
 #include <limits>
 
@@ -22,17 +24,28 @@ constexpr double kObsMaxAgeS = 0.030;     // angles older than this are not used
 constexpr double kSolveEveryS = 0.012;    // bootstrapping: at most ~80 single-frame solves per second
 constexpr double kCompareEveryS = 0.1;    // tracking: single-frame check of the filter 10x per second
 constexpr double kRadToDeg = 180.0 / math::kPi;
-constexpr double kFlushAgeS = 0.012;      // fuse buffered angles at least this often...
-constexpr int kFlushCount = 6;            // ...or as soon as this many are buffered for one base
+constexpr double kFlushStaleS = 0.045;    // angles of a rotation whose closing sync never came
+constexpr double kMaxFilterLagS = 0.1;    // the filter may trail the newest IMU sample by this much (waiting for light)
 constexpr double kNoLightZvuS = 0.1;      // libsurvive kalman-zvu-no-light-time
 constexpr double kImuOnlyAfterS = 0.25;   // no applied light update for this long: IMU only
 constexpr double kLostAfterS = 3.0;
-constexpr int kBadLightReset = 10;        // consecutive inconsistent light batches before a reset
-constexpr int kBatchDisagreeReset = 5;    // consecutive confident single-frame solves far from the filter
+constexpr int kInconsistentRecover = 3;   // consecutive rotations that disagree as a whole -> re-anchor
+constexpr int kBatchDisagreeRecover = 3;  // consecutive confident single-frame solves far from the filter -> re-anchor
+constexpr double kDisagreeMm = 60, kDisagreeDeg = 6;
 
 double Secs(Ticks t) { return t / kTicksPerSecond; }
 
 }  // namespace
+
+void DevicePipeline::Trace(const char* fmt, ...) const {
+    if (!cfg_.trace) return;
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    cfg_.trace(info_.serial + "," + buf);
+}
 
 const char* ToString(TrackState s) {
     switch (s) {
@@ -140,7 +153,7 @@ void DevicePipeline::Handle(const io::RawReport& r) {
             charging_ = b->charging;
         }
     }
-    FlushLight(false);
+    FlushLight(-1);   // stale leftovers only; complete rotations are flushed by their closing sync
     UpdateTrackState(Secs(std::max(lastImuTime_, lastLightTime_)));
     MaybeSwitchMode(r.hostUs);
 }
@@ -188,6 +201,7 @@ void DevicePipeline::OnTimeBaseReset(const std::string& reason) {
     ResetFilter(reason);
     latest_.clear();
     pending_.clear();
+    imuQueue_.clear();
     lastLightMeas_.clear();
     lastLight_.clear();
     baseLocal_.clear();
@@ -208,6 +222,7 @@ bool DevicePipeline::CheckClock(Ticks t) {
     const Ticks ref = std::max(lastImuTime_, lastLightTime_);
     if (!ref) return true;
     double d = ((double)t - (double)ref) / kTicksPerSecond;
+    if (d < -0.002 || d > 0.05) Trace("C,%.6f,%.6f,%.6f", Secs(t), Secs(ref), d);
     if (d < -0.5 || d > 10.0) {
         OnTimeBaseReset("设备时钟跳变（可能被其它程序重置了设备）");
         return true;
@@ -245,8 +260,34 @@ void DevicePipeline::OnImu(const protocol::ImuSample& s) {
     still_.Add(t, si.acc, si.gyro);
     fs_.still = still_.Still();
     fs_.stillSeconds = still_.StillSeconds();
-    if (!filter_ || !filter_->Initialized()) return;
+    // Delayed fusion: the filter runs on the light's clock. IMU samples wait in a queue until the light they
+    // overlap with has been fused (light can trail the IMU by 50+ ms over the radio); extrapolating the state
+    // back over that gap during fast hand motion is what made it diverge. The displayed pose is predicted
+    // forward over the queue (Snapshot).
+    imuQueue_.push_back({t, si, still_.Still(), still_.StillSeconds(), still_.MeanAcc()});
+    while (!imuQueue_.empty() && t - imuQueue_.front().t > 0.5) imuQueue_.pop_front();
+    FeedImuUpTo(ImuHorizon());
+}
 
+double DevicePipeline::ImuHorizon() const {
+    // never run ahead of light that is still waiting to be fused, and never lag the IMU by more than kMaxFilterLagS
+    double h = Secs(lastLightTime_);
+    for (auto& [ch, vec] : pending_)
+        for (auto& p : vec) h = std::min(h, Secs(p.o.time));
+    return std::max(h, Secs(lastImuTime_) - kMaxFilterLagS);
+}
+
+void DevicePipeline::FeedImuUpTo(double horizon) {
+    while (!imuQueue_.empty() && imuQueue_.front().t <= horizon) {
+        QueuedImu q = imuQueue_.front();
+        imuQueue_.pop_front();
+        if (filter_ && filter_->Initialized() && q.t > filter_->Time() - 1e-6) ApplyImu(q);
+    }
+}
+
+void DevicePipeline::ApplyImu(const QueuedImu& q) {
+    const double t = q.t;
+    const filter::ImuSi& si = q.si;
     SyncWorld();
     // the accelerometer only means something once world +Y is vertical
     auto u = filter_->UpdateImu(t, si.acc, si.gyro, worldAligned_ && !si.accSaturated, !si.gyroSaturated);
@@ -258,21 +299,35 @@ void DevicePipeline::OnImu(const protocol::ImuSample& s) {
     // zero-velocity updates (libsurvive "zvu"): still device, or no light for a moment
     const auto& prm = filter_->Params();
     fs_.zvu = false;
-    if (still_.Still()) {
+    if (q.still) {
         filter_->UpdateZeroVelocity(prm.zvuStationaryVar, true);
         fs_.zvu = true;
     } else if (t - lastLightUpdateT_ > kNoLightZvuS) {
         filter_->UpdateZeroVelocity(prm.zvuNoLightVar, false);
         fs_.zvu = true;
     }
+    if (cfg_.trace) {
+        const auto& P = filter_->WorldFromDevice().pos;
+        const auto& V = filter_->Velocity();
+        const auto& A = filter_->Acceleration();
+        const auto& Ba = filter_->AccBias();
+        const auto& Bg = filter_->GyroBias();
+        const auto& W = filter_->AngularVelocity();
+        Trace("I,%.6f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.5f,%.5f,%.5f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.2f,%d,%d,%.2f,%d,%d,"
+              "%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+              t, si.acc.x, si.acc.y, si.acc.z, si.gyro.x, si.gyro.y, si.gyro.z, (int)state_, P.x, P.y, P.z, V.x, V.y, V.z, A.x, A.y, A.z,
+              filter_->PositionSigma() * 1000, (int)q.still, fs_.zvu, u.nis, (int)si.accSaturated, (int)si.gyroSaturated, u.accResidual.x, u.accResidual.y,
+              u.accResidual.z, u.gyroResidual.x, u.gyroResidual.y, u.gyroResidual.z, Ba.x, Ba.y, Ba.z, Bg.x, Bg.y, Bg.z, W.x, W.y, W.z,
+              std::sqrt(filter_->Var(filter::kA)), std::sqrt(filter_->Var(filter::kTheta)) * kRadToDeg, std::sqrt(filter_->Var(filter::kV)));
+    }
     if (!filter_->Healthy()) {
         ResetFilter("滤波器发散（协方差或状态异常）");
         return;
     }
     // World tilt refinement from this device's accelerometer while it rests (SteamVR "Best tilt from ...").
-    if (state_ == TrackState::Tracking && still_.StillSeconds() > 1.0 && t - lastUpSampleT_ > 1.0 && filter_->RotationSigma() < 0.01 && cfg_.world) {
+    if (state_ == TrackState::Tracking && q.stillSeconds > 1.0 && t - lastUpSampleT_ > 1.0 && filter_->RotationSigma() < 0.01 && cfg_.world) {
         lastUpSampleT_ = t;
-        Vec3 upDev = model_->imu.mount.rot.Rotate(math::Normalize(still_.MeanAcc()));
+        Vec3 upDev = model_->imu.mount.rot.Rotate(math::Normalize(q.meanAcc));
         Vec3 upW = filter_->WorldFromDevice().rot.Rotate(upDev);
         std::scoped_lock wl(cfg_.world->mutex);
         auto& sc = cfg_.world->scene;
@@ -282,6 +337,8 @@ void DevicePipeline::OnImu(const protocol::ImuSample& s) {
 
 void DevicePipeline::OnSync(const protocol::Lh2Sync& s) {
     CheckClock(s.time);
+    Trace("S,%.6f,%d", Secs(s.time), s.channel);
+    FlushLight(s.channel);   // the previous rotation of this base is complete
     std::optional<lighthouse::BaseCalibration> cal = lh2_.OnSync(s);
     if (!lh2_.Valid(s.channel)) return;   // not (yet) a plausible base station: e.g. misparsed data
     if (cfg_.world) {
@@ -357,6 +414,7 @@ void DevicePipeline::ResetFilter(const std::string& reason) {
     badLight_ = 0;
     batchDisagree_ = 0;
     state_ = TrackState::Bootstrapping;
+    Trace("R,%.6f,%s", Secs(std::max(lastImuTime_, lastLightTime_)), reason.c_str());
     if (was) {
         ++fs_.resets;
         fs_.lastResetReason = reason;
@@ -364,13 +422,17 @@ void DevicePipeline::ResetFilter(const std::string& reason) {
     }
 }
 
-void DevicePipeline::FlushLight(bool force) {
+void DevicePipeline::FlushLight(int channel) {
     if (!filter_ || !filter_->Initialized() || !cfg_.world) {
         pending_.clear();
         return;
     }
-    const double devNow = Secs(std::max(lastImuTime_, lastLightTime_));
-    // take the due batches out first: a reset below clears pending_
+    // One update per base rotation (libsurvive integrates its saved light at each sync, SteamVR fuses "optical
+    // frames"): the rotation is complete when the next sync of that channel arrives. Stale leftovers (sync lost)
+    // are flushed after kFlushStaleS. Take the due batches out first: a reset below clears pending_.
+    // Staleness is judged on the light's own clock: light packets can trail the IMU by 50+ ms over the radio
+    // (lots of sensors lit while moving fast), which must not cut rotations into fragments.
+    const double devNow = Secs(lastLightTime_);
     std::vector<std::pair<int, std::vector<PendingObs>>> due;
     for (auto it = pending_.begin(); it != pending_.end();) {
         auto& vec = it->second;
@@ -380,7 +442,7 @@ void DevicePipeline::FlushLight(bool force) {
         }
         double oldest = Secs(vec.front().o.time);
         for (auto& p : vec) oldest = std::min(oldest, Secs(p.o.time));
-        if (!force && (int)vec.size() < kFlushCount && devNow - oldest < kFlushAgeS) {
+        if (it->first != channel && devNow - oldest < kFlushStaleS) {
             ++it;
             continue;
         }
@@ -393,12 +455,14 @@ void DevicePipeline::FlushLight(bool force) {
         filter::LightBase lb;
         bool known = false;
         uint64_t calKey = 0;
+        int refinements = 0;
         {
             std::scoped_lock wl(cfg_.world->mutex);
             const auto& sc = cfg_.world->scene;
             known = sc.HasPose(ch);
             if (known) {
                 lb.worldFromBase = sc.WorldFromBase(ch);
+                refinements = sc.Base(ch).refinements;
                 if (sc.Base(ch).cal) {
                     for (int a = 0; a < 2; ++a) lb.cal[a] = sc.Base(ch).cal->axis[a];
                     for (uint8_t x : sc.Base(ch).cal->raw) calKey = calKey * 1099511628211ull + x + 1;
@@ -407,59 +471,76 @@ void DevicePipeline::FlushLight(bool force) {
                 }
             }
         }
-        if (known) {
-            // A base whose calibration changed (OOTX replaced the ideal model or a cached one) shifts every angle a
-            // little: loosen the filter instead of rejecting the now-correct data.
-            auto ck = calKeys_.find(ch);
-            if (ck != calKeys_.end() && ck->second != calKey) filter_->Inflate(1e-4, 3e-4);
-            calKeys_[ch] = calKey;
-            std::vector<filter::LightMeas> meas;
-            meas.reserve(vec.size());
-            for (auto& p : vec) meas.push_back({0, p.sensor, p.o.plane, p.o.angle, Secs(p.o.time)});
-            auto t0 = std::chrono::steady_clock::now();
-            filter::LightUpdate u = filter_->UpdateLight(meas, {lb});
-            double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
-            fs_.lightUpdateUs = fs_.lightUpdateUs * 0.95 + us * 0.05;
-            fs_.lastChannel = ch;
-            fs_.lastUsed = u.used;
-            fs_.lastGated = u.gated;
-            fs_.lastFacingAway = u.facingAway;
-            fs_.lastIterations = u.iterations;
-            fs_.lastRmsBeforeDeg = u.rmsBeforeRad * kRadToDeg;
-            fs_.lastRmsAfterDeg = u.rmsAfterRad * kRadToDeg;
-            fs_.lastNis = u.nis;
-            fs_.lastLagMs = u.lagMs;
-            fs_.lastSpanMs = u.spanMs;
-            fs_.lastNote = u.note;
-            fs_.lightMeasurements += u.n;
-            fs_.lightGated += u.gated + u.facingAway;
-            lastLightMeas_[ch] = std::move(meas);
-            lastLight_[ch] = u;
-            if (u.applied) {
-                ++fs_.lightUpdates;
-                ++lightRateWindowN_;
-                lastLightUpdateT_ = filter_->Time();
-                badLight_ = 0;
-                const double t = filter_->Time();
-                if (t - lightRateWindowT_ >= 1.0) {
-                    if (lightRateWindowT_ > 0) fs_.lightUpdateHz = lightRateWindowN_ / (t - lightRateWindowT_);
-                    lightRateWindowT_ = t;
-                    lightRateWindowN_ = 0;
-                }
-                if (t - lastHistoryT_ >= 1.0 / 30) {
-                    lastHistoryT_ = t;
-                    const Pose& p = filter_->WorldFromDevice();
-                    history_.push_back({t, p.pos, fs_.lastRmsAfterDeg, filter_->PositionSigma() * 1000, u.used, fs_.hasBatch ? fs_.batchDiffMm : -1,
-                                        math::Norm(filter_->Velocity())});
-                    while (!history_.empty() && t - history_.front().t > 60) history_.pop_front();
-                    if (trail_.empty() || math::Norm(trail_.back() - p.pos) > 0.002) trail_.push_back(p.pos);
-                    while (trail_.size() > 600) trail_.pop_front();
-                }
-            } else {
-                ++fs_.lightSkipped;
-                ++skipReasons_[u.note.empty() ? "?" : u.note];
-                if (u.n >= 6 && u.gated > u.used && ++badLight_ >= kBadLightReset) ResetFilter("光学观测持续与滤波器预测不一致");
+        if (!known) continue;
+        // A base whose calibration changed (OOTX replaced the ideal model or a cached one) shifts every angle a
+        // little: loosen the filter instead of rejecting the now-correct data.
+        auto ck = calKeys_.find(ch);
+        if (ck != calKeys_.end() && ck->second != calKey) filter_->Inflate(1e-4, 3e-4);
+        calKeys_[ch] = calKey;
+        // the same when the base itself jumped (a multi-position refinement was applied; the bootstrap average
+        // only creeps, and loosening the filter for that costs more than the small bias)
+        auto rc = refineCounts_.find(ch);
+        if (rc != refineCounts_.end() && rc->second != refinements) {
+            filter_->Inflate(1e-4, 3e-4);
+            Trace("P,%.6f,%d", filter_->Time(), ch);
+        }
+        refineCounts_[ch] = refinements;
+        std::vector<filter::LightMeas> meas;
+        meas.reserve(vec.size());
+        for (auto& p : vec) meas.push_back({0, p.sensor, p.o.plane, p.o.angle, Secs(p.o.time)});
+        double newest = meas.empty() ? 0 : meas[0].t;
+        for (auto& m : meas) newest = std::max(newest, m.t);
+        FeedImuUpTo(newest);   // IMU up to the end of this rotation; later samples stay queued
+        if (!filter_->Initialized()) return;
+        auto t0 = std::chrono::steady_clock::now();
+        filter::LightUpdate u = filter_->UpdateLight(meas, {lb});
+        double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        fs_.lightUpdateUs = fs_.lightUpdateUs * 0.95 + us * 0.05;
+        fs_.lastChannel = ch;
+        fs_.lastUsed = u.used;
+        fs_.lastGated = u.gated;
+        fs_.lastFacingAway = u.facingAway;
+        fs_.lastIterations = u.iterations;
+        fs_.lastRmsBeforeDeg = u.rmsBeforeRad * kRadToDeg;
+        fs_.lastRmsAfterDeg = u.rmsAfterRad * kRadToDeg;
+        fs_.lastNis = u.nis;
+        fs_.lastLagMs = u.lagMs;
+        fs_.lastSpanMs = u.spanMs;
+        fs_.lastNote = u.note;
+        fs_.lightMeasurements += u.n;
+        fs_.lightGated += u.gated + u.facingAway;
+        {
+            const auto& P = filter_->WorldFromDevice().pos;
+            Trace("L,%.6f,%d,%d,%d,%d,%d,%d,%.5f,%.5f,%.3f,%.1f,%.1f,%.4f,%.4f,%.4f,%.2f,%s", filter_->Time(), ch, u.n, u.used, u.gated, u.facingAway, (int)u.applied,
+                  u.rmsBeforeRad * kRadToDeg, u.rmsAfterRad * kRadToDeg, u.nis, u.lagMs, u.spanMs, P.x, P.y, P.z, filter_->PositionSigma() * 1000, u.note.c_str());
+        }
+        lastLightMeas_[ch] = std::move(meas);
+        lastLight_[ch] = u;
+        if (u.applied) {
+            ++fs_.lightUpdates;
+            ++lightRateWindowN_;
+            lastLightUpdateT_ = filter_->Time();
+            badLight_ = 0;
+            const double t = filter_->Time();
+            if (t - lightRateWindowT_ >= 1.0) {
+                if (lightRateWindowT_ > 0) fs_.lightUpdateHz = lightRateWindowN_ / (t - lightRateWindowT_);
+                lightRateWindowT_ = t;
+                lightRateWindowN_ = 0;
             }
+            if (t - lastHistoryT_ >= 1.0 / 30) {
+                lastHistoryT_ = t;
+                const Pose& p = filter_->WorldFromDevice();
+                history_.push_back({t, p.pos, fs_.lastRmsAfterDeg, filter_->PositionSigma() * 1000, u.used, fs_.hasBatch ? fs_.batchDiffMm : -1,
+                                    math::Norm(filter_->Velocity())});
+                while (!history_.empty() && t - history_.front().t > 60) history_.pop_front();
+                if (trail_.empty() || math::Norm(trail_.back() - p.pos) > 0.002) trail_.push_back(p.pos);
+                while (trail_.size() > 600) trail_.pop_front();
+            }
+        } else {
+            ++fs_.lightSkipped;
+            ++skipReasons_[u.note.empty() ? "?" : u.note];
+            // a few whole rotations in a row that do not fit: the filter is what is wrong
+            if (u.inconsistent && ++badLight_ >= kInconsistentRecover) Recover("连续多圈光学观测与滤波器不一致");
         }
     }
 }
@@ -488,6 +569,91 @@ void DevicePipeline::UpdateTrackState(double t) {
     }
 }
 
+DevicePipeline::FrameSolve DevicePipeline::SolveRecent(Ticks ref, const Pose* seed, const Vec3& velocity, const Vec3& angularVelocity) {
+    FrameSolve out;
+    auto secs = [](Ticks a, Ticks b) { return ((double)a - (double)b) / kTicksPerSecond; };
+    // recent observations, grouped by channel; dt relative to `ref` (the motion model compensates it)
+    for (auto& [ch, vec] : latest_)
+        for (size_t s = 0; s < vec.size() && lh2_.Valid(ch); ++s)
+            for (int p = 0; p < 2; ++p) {
+                const Obs& ob = vec[s][p];
+                if (!ob.valid) continue;
+                double age = secs(ref, ob.o.time);
+                if (age < -0.005 || age > kObsMaxAgeS) continue;
+                out.byChannel[ch].push_back({0, (int)s, p, ob.o.angle, -age});
+            }
+    if (out.byChannel.empty()) return out;
+    {
+        std::scoped_lock wl(cfg_.world->mutex);
+        auto& sc = cfg_.world->scene;
+        out.worldFromRef = sc.WorldFromRef();
+        for (auto& [ch, m] : out.byChannel) {
+            sc.MarkSeen(ch);
+            BaseInfo bi{sc.HasPose(ch), sc.ReadyToBootstrap(ch), sc.Base(ch).cal.has_value(), sc.HasPose(ch) ? sc.WorldFromBase(ch) : Pose{}, {}};
+            if (sc.Base(ch).cal)
+                for (int a = 0; a < 2; ++a) bi.cal[a] = sc.Base(ch).cal->axis[a];
+            out.info[ch] = bi;
+        }
+    }
+    for (auto& [ch, m] : out.byChannel) {
+        const BaseInfo& bi = out.info[ch];
+        if (!bi.known) continue;
+        out.allCalibrated &= bi.calibrated;
+        int b = (int)out.bases.size();
+        solver::BaseView v;
+        v.worldFromBase = bi.worldFromBase;
+        v.cal[0] = bi.cal[0];
+        v.cal[1] = bi.cal[1];
+        out.bases.push_back(v);
+        for (auto mm : m) {
+            mm.base = b;
+            out.meas.push_back(mm);
+            out.measCh.push_back(ch);
+        }
+    }
+    solver::SolverOptions opt;
+    // 6-dof pose with the motion held fixed (libsurvive mpfit-model-velocity): every angle is moved to `ref` with
+    // the given velocities, so a fast moving device is solved without motion blur.
+    opt.estimateVelocity = false;
+    opt.velocityPrior = velocity;
+    opt.angularVelocityPrior = angularVelocity;
+    if (out.meas.size() >= 6) out.res = solver::SolvePose(*model_, out.meas, out.bases, seed, opt);
+    else out.res.failReason = "已知位置的基站观测不足";
+    return out;
+}
+
+bool DevicePipeline::GoodSolve(const FrameSolve& f) {
+    const auto& r = f.res;
+    return r.ok && r.used >= 8 && r.rmsRad < (f.allCalibrated ? 1e-3 : 4e-3) && r.positionSigma < 0.05 && r.rotationSigma < 0.05;
+}
+
+void DevicePipeline::Recover(const std::string& reason) {
+    // Re-anchor on an independent, motion-compensated single-frame solve (keeps velocity and IMU biases);
+    // if that is not trustworthy either, start over.
+    const Ticks ref = lastLightTime_;   // the angles' time (the IMU may run 50+ ms ahead of the light)
+    const double tRef = Secs(ref);
+    Pose seed = filter_->PoseAt(tRef);
+    FrameSolve moving = SolveRecent(ref, &seed, filter_->Velocity(), filter_->AngularVelocity());
+    FrameSolve still = SolveRecent(ref, &seed, {}, {});   // the filter's motion may be part of what went wrong
+    const FrameSolve* best = nullptr;
+    if (GoodSolve(moving)) best = &moving;
+    if (GoodSolve(still) && (!best || still.res.rmsRad < best->res.rmsRad)) best = &still;
+    if (!best) {
+        ResetFilter(reason + "，单帧解算也不可靠");
+        return;
+    }
+    filter_->Reanchor(tRef, best->res.worldFromDevice, best->res.covariance);
+    if (best == &still) filter_->UpdateZeroVelocity(1.0, false);   // loosely: the old motion was suspect
+    ++fs_.recoveries;
+    fs_.lastRecoveryReason = reason;
+    badLight_ = 0;
+    batchDisagree_ = 0;
+    lastLightUpdateT_ = tRef;
+    pending_.clear();
+    FeedImuUpTo(ImuHorizon());   // catch up with the IMU queued since the solve's time
+    Trace("V,%.6f,%s,%.5f,%d", tRef, reason.c_str(), best->res.rmsRad * kRadToDeg, best->res.used);
+}
+
 void DevicePipeline::TrySolve(Ticks now) {
     if (!model_ || !cfg_.world) return;
     // Syncs of different bases interleave, so "now" is not monotonic across calls: use signed differences.
@@ -497,87 +663,37 @@ void DevicePipeline::TrySolve(Ticks now) {
     if (lastSolveTime_ && secs(now, lastSolveTime_) < every && secs(now, lastSolveTime_) > -0.1) return;
     lastSolveTime_ = now;
     const Ticks ref = std::max(now, lastLightTime_);
+    const double tRef = Secs(ref);
     SyncWorld();
 
-    // Gather recent observations, grouped by channel.
-    std::map<int, std::vector<solver::Measurement>> byChannel;
-    for (auto& [ch, vec] : latest_)
-        for (size_t s = 0; s < vec.size() && lh2_.Valid(ch); ++s)
-            for (int p = 0; p < 2; ++p) {
-                const Obs& ob = vec[s][p];
-                if (!ob.valid) continue;
-                double age = secs(ref, ob.o.time);
-                if (age < -0.005 || age > kObsMaxAgeS) continue;
-                byChannel[ch].push_back({0, (int)s, p, ob.o.angle, -age});
-            }
-    if (byChannel.empty()) return;
-
-    // Snapshot the world for this solve.
-    struct BaseInfo {
-        bool known;
-        bool canBootstrap;
-        bool calibrated;
-        Pose worldFromBase;
-        lighthouse::AxisCal cal[2];
-    };
-    std::map<int, BaseInfo> info;
-    Pose worldFromRef;
-    {
-        std::scoped_lock wl(cfg_.world->mutex);
-        auto& sc = cfg_.world->scene;
-        worldFromRef = sc.WorldFromRef();
-        for (auto& [ch, m] : byChannel) {
-            sc.MarkSeen(ch);
-            BaseInfo bi{sc.HasPose(ch), sc.ReadyToBootstrap(ch), sc.Base(ch).cal.has_value(), sc.HasPose(ch) ? sc.WorldFromBase(ch) : Pose{}, {}};
-            if (sc.Base(ch).cal)
-                for (int a = 0; a < 2; ++a) bi.cal[a] = sc.Base(ch).cal->axis[a];
-            info[ch] = bi;
-        }
-    }
-
-    // Joint static solve against every base with a known pose.
-    std::vector<solver::Measurement> meas;
-    std::vector<int> measCh;
-    std::vector<solver::BaseView> bases;
-    bool allCalibrated = true;
-    for (auto& [ch, m] : byChannel) {
-        if (!info[ch].known) continue;
-        allCalibrated &= info[ch].calibrated;
-        int bi = (int)bases.size();
-        solver::BaseView v;
-        v.worldFromBase = info[ch].worldFromBase;
-        v.cal[0] = info[ch].cal[0];
-        v.cal[1] = info[ch].cal[1];
-        bases.push_back(v);
-        for (auto mm : m) {
-            mm.base = bi;
-            meas.push_back(mm);
-            measCh.push_back(ch);
-        }
-    }
     auto t0 = std::chrono::steady_clock::now();
-    const double tRef = Secs(ref);
     std::optional<Pose> seed;
-    if (tracking) seed = filter_->PoseAt(tRef);
-    else if (poseTime_ && std::fabs(secs(ref, poseTime_)) < 0.5) seed = lastGoodPose_;
-    solver::SolveResult res;
-    solver::SolverOptions opt;
-    opt.estimateVelocity = false;   // motion is the filter's job; this is the static bootstrap / check solve
-    if (meas.size() >= 6) res = solver::SolvePose(*model_, meas, bases, seed ? &*seed : nullptr, opt);
-    else res.failReason = "已知位置的基站观测不足";
+    Vec3 vel, angVel;
+    if (tracking) {
+        seed = filter_->PoseAt(tRef);
+        vel = filter_->Velocity();
+        angVel = filter_->AngularVelocity();
+    } else if (poseTime_ && std::fabs(secs(ref, poseTime_)) < 0.5) {
+        seed = lastGoodPose_;
+    }
+    FrameSolve fsol = SolveRecent(ref, seed ? &*seed : nullptr, vel, angVel);
+    if (fsol.byChannel.empty()) return;
+    const solver::SolveResult& res = fsol.res;
     ++solves_;
     if (!res.ok) ++solveFailures_;
     lastSolve_ = res;
-    lastMeas_ = meas;
-    lastMeasChannel_ = measCh;
-    lastBases_ = bases;
-    basesUsed_ = (int)bases.size();
+    lastMeas_ = fsol.meas;
+    lastMeasChannel_ = fsol.measCh;
+    lastBases_ = fsol.bases;
+    basesUsed_ = (int)fsol.bases.size();
+    Trace("B,%.6f,%d,%.5f,%d,%d,%.4f,%.4f,%.4f,%.2f,%s", tRef, (int)res.ok, res.rmsRad * kRadToDeg, res.used, (int)fsol.bases.size(), res.worldFromDevice.pos.x,
+          res.worldFromDevice.pos.y, res.worldFromDevice.pos.z, res.positionSigma * 1000, res.failReason.c_str());
 
     if (res.ok) {
         poseTime_ = ref;
         lastGoodPose_ = res.worldFromDevice;
         const Vec3 gyroWorld = imu_.valid ? res.worldFromDevice.rot.Rotate(model_->imu.mount.rot.Rotate(imu_.gyro)) : Vec3{};
-        const bool good = res.used >= 8 && res.rmsRad < (allCalibrated ? 1e-3 : 4e-3) && res.positionSigma < 0.05 && res.rotationSigma < 0.05;
+        const bool good = GoodSolve(fsol);
         if (!tracking) {
             // history while bootstrapping comes from the single-frame solves
             if (tRef - lastHistoryT_ >= 1.0 / 30) {
@@ -593,27 +709,24 @@ void DevicePipeline::TrySolve(Ticks now) {
                 batchDisagree_ = 0;
                 pending_.clear();
                 fs_.hasBatch = false;
+                FeedImuUpTo(ImuHorizon());   // the IMU queued since the solve's time
                 if (cfg_.log && fs_.resets == 0 && fs_.lightUpdates == 0) cfg_.log(info_.serial + ": 开始跟踪（光学 + IMU 滤波）");
             }
         } else {
-            // the filter vs an independent single-frame solve
+            // the filter vs an independent, motion-compensated single-frame solve
             Pose fp = filter_->PoseAt(tRef);
             fs_.hasBatch = true;
             fs_.batchDiffMm = math::Norm(fp.pos - res.worldFromDevice.pos) * 1000;
             fs_.batchDiffDeg = math::Norm((fp.rot * res.worldFromDevice.rot.Conj()).ToRotVec()) * kRadToDeg;
-            const bool apart = fs_.batchDiffMm > 150 || fs_.batchDiffDeg > 15;
+            const bool apart = fs_.batchDiffMm > kDisagreeMm || fs_.batchDiffDeg > kDisagreeDeg;
             if (good && res.positionSigma < 0.01 && apart) {
-                if (++batchDisagree_ >= kBatchDisagreeReset) {
-                    ResetFilter("滤波器与单帧解算长期不一致");
-                    filter_->Initialize(tRef, res.worldFromDevice, res.covariance, gyroWorld);
-                    lastLightUpdateT_ = tRef;
-                    trackingSince_ = tRef;
-                }
+                if (++batchDisagree_ >= kBatchDisagreeRecover) Recover("滤波器与单帧解算持续不一致");
             } else {
                 batchDisagree_ = 0;
             }
         }
     }
+    if (tracking && filter_->Initialized() && state_ == TrackState::Tracking) CollectRefineKeyframes(ref, fsol);
 
     // Bootstrap / refine bases we do not know (well) yet from this device, using the best pose we have.
     std::optional<Pose> devicePose;
@@ -622,12 +735,14 @@ void DevicePipeline::TrySolve(Ticks now) {
     // Only while the device is still: the per-base solve below is static, and motion between the two bases'
     // sampling times would otherwise bias the base pose.
     if (devicePose && still_.Still()) {
-        Pose refFromDevice = worldFromRef.Inverse() * *devicePose;
-        for (auto& [ch, m] : byChannel) {
-            if (!info[ch].canBootstrap || m.size() < 8) continue;
+        Pose refFromDevice = fsol.worldFromRef.Inverse() * *devicePose;
+        solver::SolverOptions opt;
+        opt.estimateVelocity = false;
+        for (auto& [ch, m] : fsol.byChannel) {
+            if (!fsol.info[ch].canBootstrap || m.size() < 8) continue;
             solver::BaseView v;
-            v.cal[0] = info[ch].cal[0];
-            v.cal[1] = info[ch].cal[1];
+            v.cal[0] = fsol.info[ch].cal[0];
+            v.cal[1] = fsol.info[ch].cal[1];
             std::vector<solver::BaseView> one{v};
             std::vector<solver::Measurement> mm = m;
             for (auto& x : mm) x.dt = 0;
@@ -640,6 +755,53 @@ void DevicePipeline::TrySolve(Ticks now) {
         }
     }
     solveUs_ = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void DevicePipeline::CollectRefineKeyframes(Ticks ref, const FrameSolve& f) {
+    // Every angle is moved to `ref` with the filter's motion; keep to moderate motion so that model is good
+    // over the ~20 ms the angles of both bases span.
+    const Vec3 vel = filter_->Velocity(), angVel = filter_->AngularVelocity();
+    if (!still_.Still() && (math::Norm(angVel) > 1.5 || math::Norm(vel) > 0.6)) return;
+    const double tRef = Secs(ref);
+    const Pose filterPose = filter_->PoseAt(tRef);
+    const Pose refFromWorld = f.worldFromRef.Inverse();
+    int refCh;
+    std::vector<int> want;
+    {
+        std::scoped_lock wl(cfg_.world->mutex);
+        const auto& sc = cfg_.world->scene;
+        refCh = sc.ReferenceChannel();
+        for (auto& [ch, m] : f.byChannel)
+            if (ch != refCh && m.size() >= 8 && sc.WantsRefineKeyframe(ch, refFromWorld * filterPose)) want.push_back(ch);
+    }
+    auto rit = f.byChannel.find(refCh);
+    auto rinfo = f.info.find(refCh);
+    if (want.empty() || rit == f.byChannel.end() || rinfo == f.info.end() || !rinfo->second.calibrated || rit->second.size() < 10) return;
+    // the device from the reference base alone: independent of the poses being refined
+    solver::BaseView view;
+    view.worldFromBase = f.worldFromRef;
+    view.cal[0] = rinfo->second.cal[0];
+    view.cal[1] = rinfo->second.cal[1];
+    std::vector<solver::Measurement> mm = rit->second;
+    for (auto& m : mm) m.base = 0;
+    solver::SolverOptions opt;
+    opt.estimateVelocity = false;
+    opt.velocityPrior = vel;
+    opt.angularVelocityPrior = angVel;
+    solver::SolveResult r = solver::SolvePose(*model_, mm, {view}, &filterPose, opt);
+    if (!r.ok || r.used < 10 || r.rmsRad > 1e-3 || r.positionSigma > 0.02 || r.rotationSigma > 0.02) return;
+    for (int ch : want) {
+        solver::RefineKeyframe k;
+        k.refFromDevice = refFromWorld * r.worldFromDevice;
+        for (const auto& m : f.byChannel.at(ch)) {
+            // the device where it was when this angle was measured (m.dt <= 0 relative to ref)
+            Pose at{(math::Quat::FromRotVec(angVel * m.dt) * r.worldFromDevice.rot).Normalized(), r.worldFromDevice.pos + vel * m.dt};
+            k.obs.push_back({refFromWorld.Apply(at.Apply(model_->points[m.sensor])), m.plane, m.angle});
+        }
+        std::scoped_lock wl(cfg_.world->mutex);
+        cfg_.world->scene.AddRefineKeyframe(ch, std::move(k));
+    }
+    Trace("K,%.6f,%zu,%.5f,%d", tRef, want.size(), r.rmsRad * kRadToDeg, r.used);
 }
 
 double DevicePipeline::LowestSensorY() const {
@@ -705,10 +867,15 @@ DeviceSnapshot DevicePipeline::Snapshot() const {
     const bool filt = filter_ && filter_->Initialized();
     if (filt) {
         const auto& f = *filter_;
-        d.worldFromDevice = f.WorldFromDevice();
-        d.poseTime = f.Time();
-        d.velocity = f.Velocity();
-        d.angularVelocity = f.AngularVelocity();
+        // The filter trails the IMU (delayed fusion): show a copy predicted over the queued IMU samples.
+        filter::TrackerFilter shown = f;
+        for (const auto& q : imuQueue_)
+            if (q.t > shown.Time()) shown.UpdateImu(q.t, q.si.acc, q.si.gyro, worldAligned_ && !q.si.accSaturated, !q.si.gyroSaturated);
+        d.worldFromDevice = shown.WorldFromDevice();
+        d.poseTime = shown.Time();
+        d.velocity = shown.Velocity();
+        d.angularVelocity = shown.AngularVelocity();
+        d.filter.filterLagMs = std::max(0.0, (Secs(lastImuTime_) - f.Time()) * 1000);
         d.velocityEstimated = true;
         d.hasPose = state_ == TrackState::Tracking || state_ == TrackState::ImuOnly;
         d.poseAgeMs = std::max(0.0, (devNow - lastLightUpdateT_) * 1000);

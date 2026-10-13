@@ -27,6 +27,7 @@ const char* ToString(PoseSource s) {
         case PoseSource::Bootstrap: return "由设备观测推算";
         case PoseSource::SavedUniverse: return "上次保存的空间";
         case PoseSource::SteamVrUniverse: return "SteamVR 房间设置（lighthousedb）";
+        case PoseSource::Refined: return "多位置精化";
         default: return "未知";
     }
 }
@@ -63,6 +64,7 @@ void Scene::SetCalibration(int ch, const lighthouse::BaseCalibration& c, bool fr
             o.fixed = false;
             o.source = PoseSource::None;
             o.samples = 0;
+            ClearRefiner((int)(&o - bases_.data()));
         }
     }
     if (b.isReference) {
@@ -81,6 +83,7 @@ bool Scene::ReadyToBootstrap(int ch) const {
 
 void Scene::Reset() {
     bases_ = {};
+    for (int ch = 0; ch < lighthouse::kMaxChannels; ++ch) ClearRefiner(ch);
     ref_ = -1;
     upSum_ = Vec3{};
     upCount_ = 0;
@@ -197,6 +200,7 @@ void Scene::AddBootstrapSample(int ch, const Pose& refFromDevice, const Pose& ba
             b.hasPose = true;
             b.source = PoseSource::Bootstrap;
             b.samples = 1;
+            ClearRefiner(ch);
             universeNote_ = "SteamVR 记录的基站位置与实测不符，已改为自行推算";
         }
         return;
@@ -208,6 +212,7 @@ void Scene::AddBootstrapSample(int ch, const Pose& refFromDevice, const Pose& ba
         b.samples = 1;
         b.lastSpreadMm = 0;
         b.rejectedSamples = 0;
+        ClearRefiner(ch);
         return;
     }
     b.lastSpreadMm = math::Norm(sample.pos - b.refFromBase.pos) * 1000;
@@ -221,6 +226,7 @@ void Scene::AddBootstrapSample(int ch, const Pose& refFromDevice, const Pose& ba
             b.source = PoseSource::Bootstrap;
             b.samples = 1;
             b.rejectedSamples = 0;
+            ClearRefiner(ch);
             universeNote_ = "基站位置与记录不符，已重新推算";
         }
         return;
@@ -296,6 +302,7 @@ void Scene::TryApplyUniverses() {
                 if (e.id == b.cal->id) evidence = std::max(evidence, e.samples);
             b.samples = u.fixed ? 0 : std::min(evidence, 200);
             b.rejectedSamples = 0;
+            ClearRefiner(ch);
             ++applied;
         }
         if (u.hasUp && upCount_ == 0 && u.upSamples > 0) {
@@ -307,6 +314,52 @@ void Scene::TryApplyUniverses() {
             universeNote_ = std::string("已从") + (u.source == "steamvr" ? " SteamVR 房间设置" : "上次保存的空间") + "恢复 " + std::to_string(applied) + " 个基站位置" +
                             (u.source == "steamvr" ? "（等待实测确认位姿方向）" : "");
     }
+}
+
+void Scene::ClearRefiner(int ch) {
+    refiners_[ch & 15].Clear();
+    ++refineGen_[ch & 15];
+    bases_[ch & 15].refineKeyframes = 0;
+}
+
+bool Scene::WantsRefineKeyframe(int ch, const Pose& refFromDevice) const {
+    const BaseState& b = bases_[ch & 15];
+    // a fixed (SteamVR) universe is taken as is; the reference base is the frame itself
+    if (ref_ < 0 || !bases_[ref_].cal || b.isReference || !b.cal || b.fixed || !HasPose(ch)) return false;
+    return refiners_[ch & 15].Wants(refFromDevice);
+}
+
+void Scene::AddRefineKeyframe(int ch, RefineKeyframe k) {
+    refiners_[ch & 15].Add(std::move(k));
+    bases_[ch & 15].refineKeyframes = refiners_[ch & 15].Count();
+}
+
+std::optional<RefineJob> Scene::TakeRefineJob(int ch) {
+    BaseRefiner& r = refiners_[ch & 15];
+    const BaseState& b = bases_[ch & 15];
+    // solve again once a few new viewpoints arrived (the first time: as soon as there are enough)
+    if (!b.cal || r.Count() < BaseRefiner::kMinKeyframes || r.Added() < 4) return std::nullopt;
+    RefineJob j;
+    j.channel = ch & 15;
+    j.generation = refineGen_[ch & 15];
+    j.refiner = r;
+    j.cal[0] = b.cal->axis[0];
+    j.cal[1] = b.cal->axis[1];
+    j.seed = b.refFromBase;
+    r.ResetAdded();
+    return j;
+}
+
+bool Scene::ApplyRefineResult(const RefineJob& job, const RefineResult& res) {
+    BaseState& b = bases_[job.channel];
+    if (job.generation != refineGen_[job.channel]) return false;   // the base restarted meanwhile
+    b.lastRefine = res;
+    if (!res.ok) return false;
+    b.refFromBase = res.refFromBase;
+    b.source = PoseSource::Refined;
+    b.samples = std::max(b.samples, 300);   // done bootstrapping: single-base averages would only drag it back
+    ++b.refinements;
+    return true;
 }
 
 UniverseRecord Scene::ExportUniverse() const {
@@ -321,7 +374,8 @@ UniverseRecord Scene::ExportUniverse() const {
             u.bases.push_back({b.cal->id, Pose{}, 0});
             continue;
         }
-        bool worth = b.fixed || b.source == PoseSource::SavedUniverse || b.source == PoseSource::SteamVrUniverse || b.samples >= 30;
+        bool worth = b.fixed || b.source == PoseSource::SavedUniverse || b.source == PoseSource::SteamVrUniverse || b.source == PoseSource::Refined ||
+                     b.samples >= 30;
         if (worth) u.bases.push_back({b.cal->id, b.refFromBase, b.samples});
     }
     if (upCount_ > 0) {

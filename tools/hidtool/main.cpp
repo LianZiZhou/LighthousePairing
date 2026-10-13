@@ -3,6 +3,7 @@
 //   lhp_hidtool capture <serial-substring|all> <seconds> <out.lhrec>
 //   lhp_hidtool dump <file.lhrec> [hex-per-id]
 #include "tracking/hid/HidDevice.h"
+#include "tracking/io/PrivacyNotice.h"
 #include "tracking/io/Recording.h"
 #include "tracking/lighthouse/Lh2Processor.h"
 #include "tracking/model/DeviceModel.h"
@@ -13,13 +14,17 @@
 #include "tracking/protocol/WatchmanDecoder.h"
 #include "tracking/service/HostGuard.h"
 #include "tracking/service/TrackingService.h"
+#include "tracking/filter/Imu.h"
 #include "tracking/sim/Simulator.h"
+#include "tracking/solver/UniverseIo.h"
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -45,6 +50,7 @@ static int Capture(const std::string& filter, double seconds, const std::string&
         std::printf("no matching device\n");
         return 1;
     }
+    std::fprintf(stderr, "注意：%s\n", io::kRecordingNoticeShort);
     std::string err;
     auto writer = io::RecordingWriter::Create(path, &err);
     if (!writer) {
@@ -329,6 +335,119 @@ static int Solve(const std::string& path, const std::string& configPath, int eve
     return 0;
 }
 
+static std::string ReadFile(const std::string& path);
+
+// Gyro vs optics: angular velocity from consecutive single-frame solves (one base, its own frame) against the
+// gyro averaged over the same interval, mapped through the IMU mount. Ratio ~1 and small angle = scale / axes right.
+static int GyroCheck(const std::string& path, const std::string& configPath, int source, int channel) {
+    io::Recording rec;
+    std::string err;
+    if (!io::LoadRecording(path, rec, &err)) return 1;
+    auto model = model::ParseDeviceModel(ReadFile(configPath), &err);
+    if (!model) {
+        std::printf("model: %s\n", err.c_str());
+        return 1;
+    }
+    protocol::WatchmanDecoder dec;
+    lighthouse::Lh2Processor lh2;
+    std::optional<lighthouse::BaseCalibration> cal;
+    std::map<int, lighthouse::Lh2Observation> latest;
+    struct Gs {
+        double t;
+        math::Vec3 g;
+    };
+    std::vector<Gs> gyro;
+    struct Sol {
+        double t;
+        math::Quat q;
+    };
+    std::vector<Sol> sols;
+    std::optional<math::Pose> last;
+    std::vector<protocol::Event> ev;
+    for (auto& r : rec.reports) {
+        if (r.sourceId != source) continue;
+        ev.clear();
+        dec.Decode(r.bytes.data(), r.bytes.size(), ev);
+        for (auto& e : ev) {
+            if (auto* s = std::get_if<protocol::ImuSample>(&e)) {
+                auto si = filter::ImuToSi(s->accel, s->gyro, &model->imu);
+                gyro.push_back({s->time / protocol::kTicksPerSecond, si.gyro});
+            } else if (auto* sw = std::get_if<protocol::Lh2Sweep>(&e)) {
+                if (auto o = lh2.OnSweep(*sw); o && o->channel == channel) latest[o->sensor * 2 + o->plane] = *o;
+            } else if (auto* sy = std::get_if<protocol::Lh2Sync>(&e)) {
+                if (auto c = lh2.OnSync(*sy); c && sy->channel == channel) cal = c;
+                if (sy->channel != channel) continue;
+                // one rotation of this base: solve from the angles of the previous rotation only
+                std::vector<solver::Measurement> meas;
+                double tm = 0;
+                for (auto& [k, o] : latest) {
+                    double age = ((double)sy->time - (double)o.time) / protocol::kTicksPerSecond;
+                    if (age < 0 || age > 0.021) continue;
+                    int idx = model->MapSensor(o.sensor);
+                    if (idx < 0) continue;
+                    meas.push_back({0, idx, o.plane, o.angle, 0});
+                    tm += o.time / protocol::kTicksPerSecond;
+                }
+                if (meas.size() < 10) {
+                    last.reset();
+                    continue;
+                }
+                tm /= meas.size();
+                solver::BaseView v;
+                if (cal)
+                    for (int a = 0; a < 2; ++a) v.cal[a] = cal->axis[a];
+                solver::SolverOptions opt;
+                opt.estimateVelocity = false;
+                auto res = solver::SolvePose(*model, meas, {v}, last ? &*last : nullptr, opt);
+                if (!res.ok || res.rmsRad > 2e-3) {
+                    last.reset();
+                    continue;
+                }
+                last = res.worldFromDevice;
+                sols.push_back({tm, res.worldFromDevice.rot});
+            }
+        }
+    }
+    std::printf("%zu solves, %zu gyro samples\n", sols.size(), gyro.size());
+    // compare over ~40 ms windows where the optical rotation is large enough to measure
+    double sumRatio = 0, sumAng = 0;
+    int n = 0;
+    std::vector<double> ratios, angles;
+    size_t gi = 0;
+    for (size_t i = 0; i + 2 < sols.size(); ++i) {
+        const auto& a = sols[i];
+        const auto& b = sols[i + 2];
+        double dt = b.t - a.t;
+        if (dt < 0.03 || dt > 0.05) continue;
+        math::Vec3 wOpt = (b.q * a.q.Conj()).ToRotVec() / dt;   // base frame
+        if (math::Norm(wOpt) < 1.0) continue;                    // need real rotation (> ~57 deg/s)
+        while (gi < gyro.size() && gyro[gi].t < a.t) ++gi;
+        math::Vec3 sum;
+        int cnt = 0;
+        for (size_t k = gi; k < gyro.size() && gyro[k].t <= b.t; ++k, ++cnt) sum += gyro[k].g;
+        if (cnt < 5) continue;
+        math::Vec3 gImu = sum / (double)cnt;
+        math::Quat mid = math::Quat::FromRotVec((b.q * a.q.Conj()).ToRotVec() * 0.5) * a.q;
+        math::Vec3 wGyro = mid.Rotate(model->imu.mount.rot.Rotate(gImu));   // IMU -> device -> base
+        double ratio = math::Norm(wGyro) / math::Norm(wOpt);
+        double ang = std::acos(std::clamp(math::Dot(math::Normalize(wGyro), math::Normalize(wOpt)), -1.0, 1.0)) * 57.2958;
+        ratios.push_back(ratio);
+        angles.push_back(ang);
+        if (n < 25)
+            std::printf("t=%.3f |w_opt|=%.2f |w_gyro|=%.2f ratio=%.3f angle=%.1fdeg  opt(%+.2f %+.2f %+.2f) gyro(%+.2f %+.2f %+.2f) imu(%+.2f %+.2f %+.2f)\n", a.t, math::Norm(wOpt),
+                        math::Norm(wGyro), ratio, ang, wOpt.x, wOpt.y, wOpt.z, wGyro.x, wGyro.y, wGyro.z, gImu.x, gImu.y, gImu.z);
+        sumRatio += ratio;
+        sumAng += ang;
+        ++n;
+    }
+    if (n) {
+        std::sort(ratios.begin(), ratios.end());
+        std::sort(angles.begin(), angles.end());
+        std::printf("windows=%d  ratio median=%.3f  angle median=%.1fdeg  (mean ratio %.3f, mean angle %.1f)\n", n, ratios[n / 2], angles[n / 2], sumRatio / n, sumAng / n);
+    }
+    return 0;
+}
+
 // Runs the full TrackingService (as the app does) for N seconds and prints snapshots.
 static std::string ReadFile(const std::string& path) {
     std::string s;
@@ -355,15 +474,73 @@ struct OneFileProvider : model::ModelProvider {
     }
 };
 
-static int Live(double seconds, const std::string& configPath, bool active, const std::string& replay) {
+// Read-only view of the app's DataDir\base_stations.json "channels" (OOTX payloads), so replays start calibrated
+// like the app does. Minimal parsing: "<ch>": { ... "ootx": "<hex>" }.
+struct AppCalibrationCache : service::CalibrationCache {
+    std::map<int, std::vector<uint8_t>> raw;
+    explicit AppCalibrationCache(const std::string& text) {
+        size_t pos = 0;
+        while ((pos = text.find("\"ootx\"", pos)) != std::string::npos) {
+            size_t q1 = text.find('"', text.find(':', pos) + 1), q2 = text.find('"', q1 + 1);
+            size_t key = text.rfind('{', pos);
+            size_t k2 = text.rfind('"', key), k1 = text.rfind('"', k2 - 1);
+            int ch = std::atoi(text.substr(k1 + 1, k2 - k1 - 1).c_str());
+            std::string hex = text.substr(q1 + 1, q2 - q1 - 1);
+            std::vector<uint8_t> b;
+            for (size_t i = 0; i + 1 < hex.size(); i += 2) b.push_back((uint8_t)std::strtoul(hex.substr(i, 2).c_str(), nullptr, 16));
+            raw[ch] = b;
+            pos = q2;
+        }
+        size_t u = text.find("\"universe\"");
+        if (u != std::string::npos) {
+            size_t b = text.find('{', u);
+            int depth = 0;
+            for (size_t i = b; b != std::string::npos && i < text.size(); ++i) {
+                depth += text[i] == '{' ? 1 : text[i] == '}' ? -1 : 0;
+                if (depth == 0) {
+                    universe = text.substr(b, i - b + 1);
+                    break;
+                }
+            }
+        }
+    }
+    std::string universe;   // the saved "universe" object, if any
+    std::vector<solver::UniverseRecord> LoadUniverses() override {
+        if (universe.empty()) return {};
+        auto u = solver::UniverseFromJson(universe);
+        if (!u) return {};
+        return {*u};
+    }
+    std::optional<lighthouse::BaseCalibration> Load(int channel) override {
+        auto it = raw.find(channel);
+        if (it == raw.end()) return std::nullopt;
+        return lighthouse::ParseOotxV15(it->second.data(), it->second.size());
+    }
+    void Save(int, const lighthouse::BaseCalibration&) override {}
+};
+
+static int Live(double seconds, const std::string& configPath, bool active, const std::string& replay, const std::string& tracePath = "") {
     auto prov = std::make_shared<OneFileProvider>();
     DWORD attr = GetFileAttributesA(configPath.c_str());
     if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
         prov->dir = configPath;
     else
         prov->json = ReadFile(configPath);
-    service::TrackingService svc(prov);
+    std::shared_ptr<service::CalibrationCache> cache;
+    if (const char* la = std::getenv("LOCALAPPDATA")) {
+        std::string text = ReadFile(std::string(la) + "\\LighthousePairing\\base_stations.json");
+        if (!text.empty() && std::getenv("LHP_NO_CACHE") == nullptr) cache = std::make_shared<AppCalibrationCache>(text);
+    }
+    service::TrackingService svc(prov, cache);
     svc.SetOptions({active});
+    std::FILE* traceFile = tracePath.empty() ? nullptr : std::fopen(tracePath.c_str(), "wb");
+    std::mutex traceMtx;
+    if (traceFile)
+        svc.SetTrace([&](const std::string& line) {
+            std::scoped_lock lk(traceMtx);
+            std::fputs(line.c_str(), traceFile);
+            std::fputc('\n', traceFile);
+        });
     sim::SimConfig simCfg;
     if (replay == "sim" || replay == "simfast") {   // simulated demo scene (simfast: as fast as possible)
         simCfg = sim::DemoScene({"SIM-A", "SIM-B"});
@@ -442,6 +619,7 @@ static int Live(double seconds, const std::string& configPath, bool active, cons
                         b.ootx.expectedBytes);
     }
     svc.Stop();
+    if (traceFile) std::fclose(traceFile);
     return 0;
 }
 
@@ -477,6 +655,8 @@ int main(int argc, char** argv) {
     if (cmd == "dump" && argc >= 3) return Dump(argv[2], argc >= 4 ? std::atoi(argv[3]) : 4);
     if (cmd == "live" && argc >= 4) return Live(std::atof(argv[2]), argv[3], argc >= 5 && std::string(argv[4]) == "active", "");
     if (cmd == "replay" && argc >= 5) return Live(std::atof(argv[2]), argv[3], false, argv[4]);
+    if (cmd == "gyrocheck" && argc >= 6) return GyroCheck(argv[2], argv[3], std::atoi(argv[4]), std::atoi(argv[5]));   // <file> <cfg> <source> <channel>
+    if (cmd == "trace" && argc >= 6) return Live(std::atof(argv[2]), argv[3], false, argv[4], argv[5]);   // trace <s> <cfg> <file> <out.csv>
     if (cmd == "solve" && argc >= 4) return Solve(argv[2], argv[3], argc >= 5 ? std::atoi(argv[4]) : 50, argc >= 6 ? std::atoi(argv[5]) : -1, argc >= 7 ? std::atoi(argv[6]) : -1);
     if (cmd == "angles" && argc >= 4) return Angles(argv[2], std::atoi(argv[3]), argc >= 5 ? std::atoi(argv[4]) : 200);
     if (cmd == "setmode" && argc >= 4) return SetMode(argv[2], argv[3]);

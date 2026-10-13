@@ -63,6 +63,9 @@ struct FilterSnapshot {
     double trackingSeconds = 0;
     uint64_t resets = 0;
     std::string lastResetReason;
+    uint64_t recoveries = 0;        // re-anchored on a single-frame solve without a reset
+    std::string lastRecoveryReason;
+    double filterLagMs = 0;         // newest IMU sample - filter time (the filter waits for the light)
     // state + 1-sigma
     math::Vec3 velocity, angularVelocity, acceleration, gyroBias, accBias;
     double posSigmaMm = 0, rotSigmaDeg = 0, velSigma = 0, angVelSigma = 0, gyroBiasSigma = 0, accBiasSigma = 0;

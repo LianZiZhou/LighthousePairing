@@ -1,0 +1,71 @@
+# Every push to main: from-scratch distribution build (build.ps1 -Dist, runs the unit tests) and a GitHub
+# release whose tag / version is the commit's short hash.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Version (short hash)
+        id: ver
+        shell: pwsh
+        run: |
+          $short = git rev-parse --short=7 HEAD
+          "short=$short" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "version: $short"
+
+      - name: Build (Release, single exe) + unit tests
+        shell: pwsh
+        run: .\build.ps1 -Dist -BuildId ${{ steps.ver.outputs.short }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = '${{ steps.ver.outputs.short }}'
+          New-Item -ItemType Directory release | Out-Null
+          Copy-Item dist\LighthousePairing.exe "release\LighthousePairing-$v.exe"
+          $hash = (Get-FileHash "release\LighthousePairing-$v.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  LighthousePairing-$v.exe" | Out-File "release\SHA256SUMS.txt" -Encoding ascii
+          $subject = git log -1 --format=%s
+          @"
+          构建自提交 $env:GITHUB_SHA（$subject）。
+
+          - ``LighthousePairing-$v.exe``：单文件程序，无需安装，下载即可运行
+          - SHA256：``$hash``
+
+          **隐私提示**：「空间」窗口录制的 ``.lhrec`` 文件包含可还原身体动作的追踪数据（敏感个人信息）。
+          请勿发送给未经授权的第三方，也不要附加到公开 issue；录制他人前须取得其明确同意。详见 README「隐私与数据保护」。
+          "@ | Out-File release\notes.md -Encoding utf8
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = '${{ steps.ver.outputs.short }}'
+          $assets = @("release\LighthousePairing-$v.exe", 'release\SHA256SUMS.txt')
+          $null = gh release view $v 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            # re-run of the same commit: refresh the assets
+            gh release upload $v @assets --clobber
+          } else {
+            gh release create $v @assets --target $env:GITHUB_SHA --title "LighthousePairing $v" --notes-file release\notes.md --latest
+          }
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

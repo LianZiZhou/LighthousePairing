@@ -48,16 +48,20 @@ public:
     bool SetFloorFromDevice(const std::string& receiverSerial);
 
     SnapshotPtr Snapshot() const;
+    /// Diagnostics sink for pipelines created after this call (see PipelineConfig::trace).
+    void SetTrace(std::function<void(const std::string&)> t) { trace_ = std::move(t); }
 
 private:
     void Loop();          // publishes snapshots (~30 Hz); must never block on slow work
-    void Housekeeping();  // discovery, host probe, saving
+    void Housekeeping();  // discovery, host probe, saving, base refinement
+    void RefineBases();   // multi-position base pose refinement solves (a few ms each)
     void Discover();
     void Publish();
     void Log(const std::string& msg);
     void MaybeSaveUniverse();
 
     std::shared_ptr<model::ModelProvider> models_;
+    std::function<void(const std::string&)> trace_;
     SharedWorld world_;
     int knownUniverses_ = 0;   // guarded by world_.mutex
     // Lock order: mtx_ -> pipeline mutex -> world_.mutex; logMtx_ is a leaf.

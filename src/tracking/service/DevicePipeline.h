@@ -48,6 +48,8 @@ struct PipelineConfig {
     SharedWorld* world = nullptr;
     std::function<void(const std::string&)> log;
     std::optional<hid::HidDeviceInfo> hidInfo;     // set for live sources (needed to send mode commands)
+    /// Diagnostics: one CSV-ish line per notable pipeline event (light update, IMU sample, reset, clock anomaly).
+    std::function<void(const std::string&)> trace;
 };
 
 class DevicePipeline {
@@ -73,15 +75,53 @@ private:
     void Run();
     void Handle(const io::RawReport& r);
     void OnImu(const protocol::ImuSample& s);
+    struct QueuedImu {
+        double t;
+        filter::ImuSi si;
+        bool still;
+        double stillSeconds;
+        math::Vec3 meanAcc;
+    };
+    /// Delayed fusion: the filter runs on the light's clock; IMU samples wait in imuQueue_ until this time.
+    double ImuHorizon() const;
+    void FeedImuUpTo(double horizon);
+    void ApplyImu(const QueuedImu& q);
     void OnSync(const protocol::Lh2Sync& s);
     void OnSweep(const protocol::Lh2Sweep& w);
     /// Single-frame solve (SteamVR's CLighthousePoseSolver role): starts the filter, checks it, bootstraps bases.
     void TrySolve(protocol::Ticks now);
-    /// Feeds buffered sweep angles to the filter (one update per base station).
-    void FlushLight(bool force);
+    /// Feeds buffered sweep angles to the filter: one update per completed base rotation (`channel`), plus any
+    /// stale leftovers (channel = -1: only those).
+    void FlushLight(int channel);
+    struct BaseInfo {
+        bool known;
+        bool canBootstrap;
+        bool calibrated;
+        math::Pose worldFromBase;
+        lighthouse::AxisCal cal[2];
+    };
+    struct FrameSolve {
+        std::map<int, std::vector<solver::Measurement>> byChannel;
+        std::map<int, BaseInfo> info;
+        math::Pose worldFromRef;
+        std::vector<solver::Measurement> meas;
+        std::vector<int> measCh;
+        std::vector<solver::BaseView> bases;
+        bool allCalibrated = true;
+        solver::SolveResult res;
+    };
+    /// Single-frame solve of the latest angles at `ref`, motion-compensated with the given velocities.
+    FrameSolve SolveRecent(protocol::Ticks ref, const math::Pose* seed, const math::Vec3& velocity, const math::Vec3& angularVelocity);
+    static bool GoodSolve(const FrameSolve& f);
+    /// Keyframes for the multi-position base refinement (Scene / BaseRefiner): device pose from the reference
+    /// base alone + the other bases' angles at the same moment.
+    void CollectRefineKeyframes(protocol::Ticks ref, const FrameSolve& f);
+    /// The filter disagrees with the light: re-anchor on a single-frame solve, or reset.
+    void Recover(const std::string& reason);
     void SyncWorld();               // re-express the filter when the world frame changed
     void ResetFilter(const std::string& reason);
     void OnTimeBaseReset(const std::string& reason);   // device timestamps changed epoch
+    void Trace(const char* fmt, ...) const;
     bool CheckClock(protocol::Ticks t);
     void UpdateTrackState(double t);
     void MaybeSwitchMode(uint64_t hostUs);
@@ -151,12 +191,14 @@ private:
     std::map<int, filter::LightUpdate> lastLight_;
     std::map<std::string, uint64_t> skipReasons_;
     std::map<int, uint64_t> calKeys_;       // per channel: calibration the filter last used
+    std::map<int, int> refineCounts_;       // per channel: base refinements applied when the filter last used it
     std::map<int, uint32_t> ootxLogged_;    // per channel: base id already announced in the log
     double lightRateWindowT_ = 0;
     uint64_t lightRateWindowN_ = 0;
 
     // imu
     ImuSnapshot imu_;
+    std::deque<QueuedImu> imuQueue_;        // not yet fused (newer than the light waiting to be fused)
     protocol::Ticks lastImuTime_ = 0, firstImuTime_ = 0;
     uint64_t imuCount_ = 0;
     int battery_ = -1;

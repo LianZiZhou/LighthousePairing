@@ -5,6 +5,7 @@
 #include "implot.h"
 #include "ui/Icons.h"
 #include "ui/Theme.h"
+#include "tracking/io/PrivacyNotice.h"
 #include "ui/Widgets.h"
 #include "util/Text.h"
 
@@ -144,14 +145,20 @@ void SpatialView::DrawToolbar(const Snap& s) {
     if (!s.recording) {
         ImGui::BeginDisabled(s.replay);
         if (ImGui::Button(ICON_RECORD " 录制")) {
-            std::string path = recordDir_ + "\\" + FormatTimestampForFile() + ".lhrec";
-            std::string err;
-            if (!svc_.StartRecording(path, &err)) lastError_ = err;
+            if (recordNoticeAck_) StartRecording();
+            else ImGui::OpenPopup(kRecordNoticeId);
         }
         ImGui::EndDisabled();
-    } else if (ImGui::Button(ICON_STOP " 停止录制")) {
-        svc_.StopRecording();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", io::kRecordingNoticeShort);
+    } else {
+        if (ImGui::Button(ICON_STOP " 停止录制")) svc_.StopRecording();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", io::kRecordingNoticeShort);
     }
+    if (openRecordNotice_) {
+        ImGui::OpenPopup(kRecordNoticeId);
+        openRecordNotice_ = false;
+    }
+    DrawRecordNotice();
     ImGui::SameLine();
     if (ImGui::Button(ICON_OPENFILE " 回放…")) {
         std::string f = sys::PickOpenFile(L"Lighthouse 录制 (*.lhrec)\0*.lhrec\0所有文件\0*.*\0", recordDir_);
@@ -203,6 +210,42 @@ void SpatialView::DrawToolbar(const Snap& s) {
         ImGui::SameLine();
         if (ImGui::SmallButton("×")) lastError_.clear();
     }
+}
+
+void SpatialView::StartRecording() {
+    std::string path = recordDir_ + "\\" + FormatTimestampForFile() + ".lhrec";
+    std::string err;
+    if (!svc_.StartRecording(path, &err)) lastError_ = err;
+}
+
+void SpatialView::DrawRecordNotice() {
+    const auto& p = Pal();
+    float fs = ImGui::GetFontSize();
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(fs * 34, 0));
+    if (!ImGui::BeginPopupModal(kRecordNoticeId, nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings)) return;
+    ImGui::PushTextWrapPos(0);
+    TextColored2(p.warning, ICON_SHIELD " %s", io::kRecordingNoticeTitle);
+    ImGui::Spacing();
+    ImGui::TextUnformatted(io::kRecordingNoticeWhat);
+    ImGui::Spacing();
+    ImGui::TextUnformatted(io::kRecordingNoticeWhy);
+    ImGui::Spacing();
+    ImGui::TextUnformatted(io::kRecordingNoticeRules);
+    TextDim("保存位置：%s", recordDir_.c_str());
+    ImGui::Spacing();
+    TextDim("%s", io::kRecordingNoticeDisclaimer);
+    ImGui::PopTextWrapPos();
+    ImGui::Separator();
+    ImGui::Checkbox("本次运行期间不再提示", &recordNoticeSkip_);
+    if (ImGui::Button(ICON_RECORD " 我已了解，开始录制")) {
+        recordNoticeAck_ = recordNoticeSkip_;
+        ImGui::CloseCurrentPopup();
+        StartRecording();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("取消") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
 }
 
 void SpatialView::BuildScene(const Snap& s) {
@@ -462,6 +505,8 @@ void SpatialView::TabDevice(const Snap& s, const Dev& d) {
         if (f.state == TrackState::Tracking || f.state == TrackState::ImuOnly) st += Fmt("（%.0f 秒）", f.trackingSeconds);
         PropRow("跟踪状态", st, false, &sc);
         if (f.resets) PropRow("重置次数", Fmt("%llu · 最近一次：%s", (unsigned long long)f.resets, f.lastResetReason.c_str()));
+        if (f.recoveries) PropRow("重新锚定", Fmt("%llu · 最近一次：%s", (unsigned long long)f.recoveries, f.lastRecoveryReason.c_str()));
+        if (f.state == TrackState::Tracking || f.state == TrackState::ImuOnly) PropRow("融合延迟", Fmt("%.0f ms（等待光学数据，显示位姿由 IMU 预测补齐）", f.filterLagMs));
         EndPropTable();
     }
     ImGui::Spacing();

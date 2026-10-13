@@ -14,8 +14,8 @@ BEGIN
         BEGIN
             VALUE "FileDescription", "Lighthouse Pairing Manager"
             VALUE "ProductName", "LighthousePairing"
-            VALUE "FileVersion", "0.4.0"
-            VALUE "ProductVersion", "0.4.0"
+            VALUE "FileVersion", LHP_VERSION
+            VALUE "ProductVersion", LHP_PRODUCT_VERSION
             VALUE "LegalCopyright", "Copyright (C) 2026 LianZhou. GPL-3.0-or-later"
         END
     END
