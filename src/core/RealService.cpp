@@ -24,6 +24,20 @@ namespace {
 
 constexpr double kOnlineImuHz = 20.0;
 
+/// Receiver ids as printed in console events may lack the "-LYM" / "-RYB" suffix of the id the receiver
+/// reports for itself; compare the part before it.
+bool SameReceiver(std::string_view a, std::string_view b) {
+    auto base = [](std::string_view s) { return s.substr(0, s.find('-')); };
+    return !a.empty() && !b.empty() && IEquals(base(a), base(b));
+}
+
+Receiver* FindReceiver(AppState& s, std::string_view id) {
+    if (auto* r = s.Find(id)) return r;
+    for (auto& r : s.receivers)
+        if (SameReceiver(r.serial, id)) return &r;
+    return nullptr;
+}
+
 /// Lines of `lines` that describe `serial`: from the first line mentioning it up to the next
 /// line that mentions a different LHR serial. Falls back to everything.
 std::vector<std::string> SectionFor(const std::vector<std::string>& lines, const std::string& serial) {
@@ -201,6 +215,8 @@ private:
     void RunOp(OpKind kind, std::string serial, std::string deviceType, double timeout, uint64_t id);
     void SetOp(uint64_t id, OpPhase phase, const std::string& msg);
     bool RunSimpleDongleCommand(const std::string& serial, const std::string& cmd, std::vector<std::string>& out, std::string& err);
+    /// `unpair` on one receiver (its monitor paused meanwhile); clears the pairing it records.
+    bool UnpairReceiver(const std::string& serial, std::string* err);
 
     HistoryDb history_;
     std::string consolePath_;
@@ -560,10 +576,10 @@ void RealService::HandleConsoleLine(const std::string& receiver, const std::stri
         if (parser::LooksLikeError(line)) lvl = LogLevel::Warning;
         Store::LogUnlocked(s, lvl, receiver, line);
         double now = NowSeconds();
-        auto target = [&](const std::string& ser) -> Receiver* {
-            if (auto* r = s.Find(ser)) return r;
-            return s.Find(receiver);
-        };
+        // The receiver named in the line; the session's own receiver only when the line names none. Every
+        // console session prints events of all receivers, so falling back would credit e.g. a device that
+        // reconnects to its old receiver to the receiver being paired.
+        auto target = [&](const std::string& ser) -> Receiver* { return ser.empty() ? s.Find(receiver) : FindReceiver(s, ser); };
         std::visit(
             [&](auto&& e) {
                 using T = std::decay_t<decltype(e)>;
@@ -1043,6 +1059,52 @@ bool RealService::RunSimpleDongleCommand(const std::string& serial, const std::s
     return ok;
 }
 
+bool RealService::UnpairReceiver(const std::string& serial, std::string* err) {
+    {
+        std::scoped_lock lk(monMtx_);
+        paused_[serial] = true;
+    }
+    StopMonitor(serial);
+    bool ok = [&] {
+        ConsoleSession session(ConsoleExe(), serial, [this, serial](const std::string& l) { HandleConsoleLine(serial, l, false); });
+        if (!session.Start(err, 12.0)) return false;
+        bool matched = std::any_of(session.StartupLines().begin(), session.StartupLines().end(), [&](auto& l) {
+            auto ev = parser::Classify(l);
+            return std::holds_alternative<parser::EvSessionConnected>(ev) && IEquals(std::get<parser::EvSessionConnected>(ev).receiver, serial);
+        });
+        if (!matched) {
+            if (err) *err = "lighthouse_console 没有连接到 " + serial;
+            return false;
+        }
+        store.Log(LogLevel::Command, serial, "lh> unpair");
+        std::vector<std::string> out;
+        if (!session.Execute("unpair", &out, 10.0, err)) return false;
+        auto bad = std::find_if(out.begin(), out.end(), [](auto& l) { return std::holds_alternative<parser::EvCommandError>(parser::Classify(l)); });
+        if (bad != out.end()) {
+            if (err) *err = *bad;
+            return false;
+        }
+        return true;
+    }();
+    if (ok) {
+        history_.ForgetPairing(serial);
+        history_.Save();
+        store.With([&](AppState& s) {
+            if (auto* r = s.Find(serial)) {
+                r->pairedSerial.clear();
+                r->pairedModel.clear();
+                r->pairingSource = PairingSource::None;
+                r->device.reset();
+            }
+        });
+    }
+    {
+        std::scoped_lock lk(monMtx_);
+        paused_[serial] = false;
+    }
+    return ok;
+}
+
 void RealService::RunOp(OpKind kind, std::string serial, std::string deviceType, double timeout, uint64_t id) {
     auto fail = [&](const std::string& msg) {
         SetOp(id, OpPhase::Failed, msg);
@@ -1119,6 +1181,15 @@ void RealService::RunOp(OpKind kind, std::string serial, std::string deviceType,
         return;
     }
 
+    // A device already online on the target would make the IMU-rate check below report success at once.
+    bool targetHadDevice = false;
+    if (kind == OpKind::Pair) {
+        std::vector<std::string> imuOut;
+        if (session.Execute("imustats", &imuOut, 3.0, nullptr))
+            for (auto& l : imuOut)
+                if (auto imu = parser::ParseImuStats(l); imu && imu->rateHz >= kOnlineImuHz) targetHadDevice = true;
+    }
+
     std::vector<std::string> out;
     SetOp(id, OpPhase::Running, std::string("发送 ") + opName);
     store.Log(LogLevel::Command, serial, std::string("lh> ") + opName);
@@ -1176,14 +1247,25 @@ void RealService::RunOp(OpKind kind, std::string serial, std::string deviceType,
                     }
                 }
                 if (auto* c = std::get_if<parser::EvDeviceConnected>(&ev)) {
-                    success = true;
-                    device = c->device;
+                    // the console prints every receiver's events: only a connection to the target counts
+                    if (SameReceiver(c->receiver, serial)) {
+                        success = true;
+                        device = c->device;
+                    } else {
+                        store.Log(LogLevel::Warning, serial,
+                                  c->device + " 连接到了其他接收器 " + c->receiver + "（不是配对模式，或被原接收器连回），继续等待…");
+                        store.With([&](AppState& s) {
+                            if (s.op.id == id)
+                                s.op.warning = c->device + " 连回了原接收器 " + c->receiver +
+                                               "。请先关闭设备，再按上面的方法进入配对模式（指示灯蓝色闪烁），而不是直接开机。";
+                        });
+                    }
                 }
             }
             opLines_.clear();
         }
         if (success || failed) break;
-        if (NowSeconds() - lastPoll > 2.0) {
+        if (!targetHadDevice && NowSeconds() - lastPoll > 2.0) {
             lastPoll = NowSeconds();
             std::vector<std::string> imuOut;
             if (session.Execute("imustats", &imuOut, 3.0, nullptr))
@@ -1248,9 +1330,37 @@ void RealService::RunOp(OpKind kind, std::string serial, std::string deviceType,
         }
         if (s.op.id == id) s.op.resultDevice = device;
     });
+
+    // A receiver that held this device before keeps its half of the pairing and takes the device back as
+    // soon as it is restarted. SteamVR's pairing does the same after "Pairing Success": it unpairs the
+    // device's previous receiver.
+    std::string cleared, notCleared;
+    if (!device.empty()) {
+        std::vector<std::string> previous = store.With([&](AppState& s) {
+            std::vector<std::string> v;
+            for (auto& o : s.receivers)
+                if (!SameReceiver(o.serial, serial) && o.kind != ReceiverKind::Wired && o.usb.present && IEquals(o.pairedSerial, device))
+                    v.push_back(o.serial);
+            return v;
+        });
+        for (auto& old : previous) {
+            SetOp(id, OpPhase::Verifying, "解除原接收器 " + old + " 与 " + device + " 的配对…");
+            std::string e;
+            if (UnpairReceiver(old, &e)) cleared += (cleared.empty() ? "" : "、") + old;
+            else {
+                notCleared += (notCleared.empty() ? "" : "、") + old;
+                store.Log(LogLevel::Warning, old, "未能解除原配对: " + e);
+            }
+        }
+    }
     release();
-    SetOp(id, OpPhase::Succeeded, device.empty() ? "配对成功（未能读到设备序列号）" : "配对成功: " + device + " → " + serial);
+    std::string msg = device.empty() ? "配对成功（未能读到设备序列号）" : "配对成功: " + device + " → " + serial;
+    if (!cleared.empty()) msg += "；已解除原接收器 " + cleared + " 的配对";
+    SetOp(id, OpPhase::Succeeded, msg);
     store.AddToast(Toast::Kind::Success, "配对成功", (device.empty() ? std::string("新设备") : device) + " 已配对到 " + serial, 8);
+    if (!notCleared.empty())
+        store.AddToast(Toast::Kind::Warning, "原配对未清除",
+                       "接收器 " + notCleared + " 仍记录着 " + device + "，设备可能会被它连回。可在该接收器上执行“解除配对”。", 12);
     StartRefresh();
 }
 

@@ -206,6 +206,11 @@ void App::DrawPairWizard(AppState& s) {
                 StatusDot(Mix(p.accent, p.info, pulse), fs * 0.35f, true);
                 ImGui::SameLine();
                 TextDim("接收器 %s 正在等待设备…", op.target.c_str());
+                if (!op.warning.empty()) {
+                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + fs * 22);
+                    TextColored2(p.warning, ICON_WARNING " %s", op.warning.c_str());
+                    ImGui::PopTextWrapPos();
+                }
                 ImGui::EndGroup();
             } else if (op.phase == OpPhase::Succeeded) {
                 TextColored2(p.success, ICON_CHECK);

@@ -195,6 +195,7 @@ struct Operation {
     std::string target;        // receiver serial
     std::string deviceType;    // pairing hint
     std::string message;
+    std::string warning;       // shown while waiting (e.g. the device reconnected to another receiver)
     std::string resultDevice;  // newly paired device serial
     std::string backupFile;
     double startedT = 0;
