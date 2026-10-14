@@ -17,7 +17,6 @@ struct DangerDialog {
     bool justOpened = false;
     Command::Type type = Command::Type::Unpair;
     std::string serial;
-    char confirm[64] = {};
 };
 
 struct PairWizard {

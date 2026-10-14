@@ -20,12 +20,6 @@ void CenterNext(float wMul, float hMul = 0) {
     ImGui::SetNextWindowSize(ImVec2(fs * wMul, hMul > 0 ? fs * hMul : 0), ImGuiCond_Always);
 }
 
-std::string Last4(const std::string& s) {
-    std::string base = s;
-    auto dash = base.find('-');
-    if (dash != std::string::npos) base = base.substr(0, dash);
-    return base.size() > 4 ? base.substr(base.size() - 4) : base;
-}
 
 void StepRow(bool done, bool active, const char* text) {
     const auto& p = Pal();
@@ -332,14 +326,8 @@ void App::DrawDangerDialog(AppState& s) {
         EndCard();
         if (!s.conflicts.empty()) TextColored2(p.warning, ICON_WARNING "  SteamVR / Pimax 等程序仍在运行，建议先关闭。");
         ImGui::Spacing();
-        std::string need = reset ? "RESET-" + Last4(d.serial) : Last4(d.serial);
-        ImGui::TextUnformatted(Fmt("请输入 %s 以确认：", need.c_str()).c_str());
-        ImGui::SetNextItemWidth(fs * 12);
-        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
-        ImGui::InputText("##confirm", d.confirm, sizeof d.confirm, ImGuiInputTextFlags_CharsUppercase);
-        bool match = IEquals(d.confirm, need);
         ImGui::Spacing();
-        ImGui::BeginDisabled(!match || s.op.Active());
+        ImGui::BeginDisabled(s.op.Active());
         if (DangerButton(reset ? ICON_DELETE "  恢复出厂" : ICON_LINK "  解除配对", ImVec2(fs * 9, 0))) {
             Post({d.type, d.serial});
             d.open = false;
