@@ -64,6 +64,7 @@ bool ConsoleSession::Start(std::string* error, double timeoutS) {
 
     std::wstring cmd = L"\"" + exe_ + L"\"";
     if (!serial_.empty()) cmd += L" /serial " + ToWide(serial_);
+    cmd += extraArgs_;
     std::wstring dir = DirOf(exe_);
 
     PROCESS_INFORMATION pi{};

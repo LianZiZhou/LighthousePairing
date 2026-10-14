@@ -164,10 +164,16 @@ C++20 没有 `std::expected`，用 `tl::expected`（vcpkg 包名 `tl-expected`�
 冲突检测：vrserver / pi_server 在运行？──是──► 提示关闭（可一键关闭）
      │
      ▼
+其他接收器全部 /pairstop（配对是广播的，只有目标接收器处于配对模式才能保证配到它）
+     │
+     ▼
 serial <dongle>  →  pair  →  倒计时（默认 30s）
      │            UI 显示：“现在把 Index 手柄关机后同时按住 B + 系统键，直到指示灯蓝色闪烁”
+     │            期间每 4s 再对其他接收器 /pairstop（防 SteamVR 等重新打开配对）
+     │            若设备仍连到了别的接收器且类型吻合 → 自动解除那个接收器的配对，重新计时（最多 2 次）
      ▼
 等待 "Pairing Success" 或 设备连接事件 ──超时──► pairstop，提示重试
+     │            结束后对目标接收器 /pairstop
      │
      ▼
 校验：再执行一次 dongleinfo/deviceinfo，确认设备确实连在“这个”接收器上

@@ -142,7 +142,7 @@ void App::DrawPairWizard(AppState& s) {
                 std::string names;
                 for (auto& c : s.conflicts) names += c.exe + " ";
                 TextColored2(p.warning, ICON_WARNING "  检测到可能占用接收器的程序：%s", names.c_str());
-                TextDim("配对时建议先退出 SteamVR / Pimax 软件，否则命令可能失败或被它们干扰。");
+                TextDim("配对时建议先退出 SteamVR / Pimax 软件：它们可能让其他接收器也进入配对模式，抢走设备。");
                 if (DangerButton(ICON_STOP "  结束这些进程")) Post({Command::Type::KillConflicts});
                 ImGui::SameLine();
                 ImGui::Checkbox("仍然继续", &w.conflictAck);
@@ -163,7 +163,7 @@ void App::DrawPairWizard(AppState& s) {
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
-            TextDim("开始前会自动备份当前状态");
+            TextDim("开始前会自动备份当前状态，并让其他接收器退出配对模式，确保设备只会配到这个接收器");
         }
     } else {
         const Operation& op = s.op;

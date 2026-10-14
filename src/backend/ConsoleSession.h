@@ -22,6 +22,9 @@ public:
     ConsoleSession(const ConsoleSession&) = delete;
     ConsoleSession& operator=(const ConsoleSession&) = delete;
 
+    /// Extra command-line flags appended after "/serial X" (e.g. L" /pairstop"). Call before Start().
+    void SetExtraArgs(std::wstring args) { extraArgs_ = std::move(args); }
+
     /// Spawn the process and wait for the first prompt.
     bool Start(std::string* error, double timeoutS = 10.0);
 
@@ -46,6 +49,7 @@ private:
 
     std::wstring exe_;
     std::string serial_;
+    std::wstring extraArgs_;
     LineSink sink_;
 
     void* process_ = nullptr;
